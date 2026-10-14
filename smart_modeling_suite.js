@@ -1,13 +1,12 @@
 /*
  * Smart Modeling Suite for Blockbench
- * Version 0.5.0
+ * Version 0.6.0
  *
  * Features:
  *  - Smart Mirror Modeling for cubes (X/Y/Z mirror planes)
  *  - Exact duplicate cube checker
  *  - Safe texture optimizer with exact pixel reuse + lossless solid/scaled-pattern reduction
  *  - Restore previous selection
- *  - Sticky selection mode + explicit clear button
  *  - Smart Vertex Snap with corner movement, mirror-plane alignment and edge workflows
  *  - Symmetric layered 3D blade generator for flat cube profiles
  *
@@ -17,7 +16,7 @@
 
 (function() {
     const PLUGIN_ID = 'smart_modeling_suite';
-    const VERSION = '0.5.0';
+    const VERSION = '0.6.0';
     const EPS = 1e-7;
 
     let actions = [];
@@ -52,12 +51,9 @@
         duplicateReviewNode: null,
         cssHandle: null,
 
-        stickySelection: false,
         selectionGuard: false,
         currentSelection: [],
         previousSelection: [],
-        stickySelectionSnapshot: [],
-        allowExplicitClear: false,
     };
 
     function log(...args) {
@@ -692,9 +688,9 @@
         const uuids = cubes.map(c => c.uuid);
         try {
             Undo.initEdit({elements: cubes.slice(), outliner: true});
-            const fake = {aspects: {elements: cubes.slice(), outliner: true}, message: 'SMS: Spiegelung anwenden'};
+            const fake = {aspects: {elements: cubes.slice(), outliner: true}, message: 'SMS: Apply Mirror'};
             synchronizeSmartMirrorInline(fake, uuids);
-            Undo.finishEdit('SMS: Spiegelung anwenden', fake.aspects);
+            Undo.finishEdit('SMS: Apply Mirror', fake.aspects);
             if (!options.silent) quick(`${cubes.length} Cube(s) mit Smart Mirror synchronisiert`);
         } catch (e) {
             warn('Manual Smart Mirror failed', e);
@@ -835,8 +831,20 @@
         if (data.element && data.element.type === 'cube') return data.element;
         let object = data.intersect && data.intersect.object;
         while (object) {
+            const attached = [
+                object.cube,
+                object.element,
+                object.userData && object.userData.cube,
+                object.userData && object.userData.element,
+            ].find(candidate => candidate && candidate.type === 'cube');
+            if (attached) return attached;
             const cube = Cube && Cube.all ? Cube.all.find(candidate => candidate && candidate.mesh === object) : null;
             if (cube) return cube;
+            const objectUUID = object.uuid || (object.userData && (object.userData.uuid || object.userData.element_uuid));
+            if (objectUUID && Cube && Cube.all) {
+                const uuidMatch = Cube.all.find(candidate => candidate && (candidate.uuid === objectUUID || (candidate.mesh && candidate.mesh.uuid === objectUUID)));
+                if (uuidMatch) return uuidMatch;
+            }
             object = object.parent;
         }
         return null;
@@ -853,9 +861,22 @@
         return null;
     }
 
-    function getRaycastPoint(data) {
+    function getRaycastPoint(data, cube = null) {
         if (!data) return null;
-        const direct = vectorFromRaycastValue(data.intersect && data.intersect.point) || vectorFromRaycastValue(data.vertex);
+        const intersection = vectorFromRaycastValue(data.intersect && data.intersect.point);
+        if (intersection) return intersection;
+
+        // RaycastResult.vertex is a cube-local ArrayVector3 in a number of
+        // Blockbench builds. Let Blockbench itself convert it, otherwise rotated
+        // groups resolve to the wrong corner and adjacent corners appear unrelated.
+        if (cube && data.vertex && typeof Vertexsnap !== 'undefined' && Vertexsnap && typeof Vertexsnap.getGlobalVertexPos === 'function') {
+            try {
+                const converted = vectorFromRaycastValue(Vertexsnap.getGlobalVertexPos(cube, data.vertex));
+                if (converted) return converted;
+            } catch (_) {}
+        }
+
+        const direct = vectorFromRaycastValue(data.vertex);
         if (direct) return direct;
         if (Array.isArray(data.intersects)) {
             for (const intersection of data.intersects) {
@@ -864,19 +885,61 @@
             }
         }
         if (Array.isArray(data.vertices) && data.vertices.length === 2) {
-            const a = vectorFromRaycastValue(data.vertices[0]);
-            const b = vectorFromRaycastValue(data.vertices[1]);
+            let a = null;
+            let b = null;
+            if (cube && typeof Vertexsnap !== 'undefined' && Vertexsnap && typeof Vertexsnap.getGlobalVertexPos === 'function') {
+                try {
+                    a = vectorFromRaycastValue(Vertexsnap.getGlobalVertexPos(cube, data.vertices[0]));
+                    b = vectorFromRaycastValue(Vertexsnap.getGlobalVertexPos(cube, data.vertices[1]));
+                } catch (_) {}
+            }
+            a = a || vectorFromRaycastValue(data.vertices[0]);
+            b = b || vectorFromRaycastValue(data.vertices[1]);
             if (a && b) return a.add(b).multiplyScalar(0.5);
         }
         return null;
     }
 
+    function closestCubeToFeaturePoint(point, type, preferredCube = null) {
+        if (!point || typeof Cube === 'undefined' || !Cube.all) return preferredCube;
+        const candidates = preferredCube ? [preferredCube] : Cube.all;
+        let bestCube = null;
+        let bestDistance = Infinity;
+        for (const cube of candidates) {
+            const geometry = getCubeFeatureGeometry(cube);
+            if (!geometry) continue;
+            if (type === 'line' || type === 'edge') {
+                for (const edge of geometry.edges) {
+                    const distance = pointToSegmentDistance(point, edge.a.world, edge.b.world);
+                    if (distance < bestDistance) {
+                        bestDistance = distance;
+                        bestCube = cube;
+                    }
+                }
+            } else {
+                for (const vertex of geometry.vertices) {
+                    const distance = vertex.world.distanceTo(point);
+                    if (distance < bestDistance) {
+                        bestDistance = distance;
+                        bestCube = cube;
+                    }
+                }
+            }
+        }
+        return bestCube;
+    }
+
     function resolveCubeFeatureHit(data) {
-        const cube = raycastCubeFromData(data);
+        let cube = raycastCubeFromData(data);
+        const sourceCube = getCubeByUUID(state.advancedVertex.sourceCubeUUID);
+        const sourceStages = ['source_feature', 'source_edge_second_vertex'];
+        if (!cube && sourceCube && sourceStages.includes(state.advancedVertex.stage)) cube = sourceCube;
+        let point = getRaycastPoint(data, cube);
+        if (!cube && point) cube = closestCubeToFeaturePoint(point, data && data.type);
         if (!cube) return null;
         const geometry = getCubeFeatureGeometry(cube);
         if (!geometry) return null;
-        const point = getRaycastPoint(data);
+        point = getRaycastPoint(data, cube) || point;
 
         if (data.type === 'vertex') {
             let vertex = null;
@@ -904,6 +967,18 @@
             return {type: 'edge', cube, edge, geometry};
         }
         return null;
+    }
+
+    function modifierPressed(data, key) {
+        const event = data && data.event;
+        if (event && event[`${key}Key`]) return true;
+        try {
+            if (typeof Pressing !== 'undefined' && Pressing) {
+                if (Pressing[key]) return true;
+                if (Pressing.overrides && Pressing.overrides[key]) return true;
+            }
+        } catch (_) {}
+        return false;
     }
 
     function findEquivalentCubeEdge(cube, descriptor) {
@@ -1129,7 +1204,7 @@
             Undo.initEdit({elements: [sourceCube], outliner: !!state.smartMirrorEnabled});
             if (!translateCubeWorld(sourceCube, sourceVertex.world, targetVertex.world)) throw new Error('Could not translate source corner');
             updateCubeGeometryNow(sourceCube);
-            Undo.finishEdit('SMS: Ecke auf Ecke verschieben', {elements: [sourceCube], outliner: !!state.smartMirrorEnabled});
+            Undo.finishEdit('SMS: Move Corner to Corner', {elements: [sourceCube], outliner: !!state.smartMirrorEnabled});
             return true;
         } catch (e) {
             warn('Smart corner snap failed', e);
@@ -1137,6 +1212,14 @@
             quick('Die Ecke konnte nicht verschoben werden');
             return false;
         }
+    }
+
+    function translateCubeOnSingleAxis(cube, axis, delta) {
+        if (!cube || !Number.isInteger(axis) || axis < 0 || axis > 2 || !Number.isFinite(delta)) return false;
+        cube.from[axis] += delta;
+        cube.to[axis] += delta;
+        cube.origin[axis] += delta;
+        return true;
     }
 
     function moveSourceVertexToMirrorPlane(sourceCube, sourceDescriptor) {
@@ -1156,12 +1239,16 @@
             const delta = state.mirrorPlane - coordinate;
             if (!Number.isFinite(delta)) throw new Error('Invalid mirror-axis offset');
 
-            Undo.initEdit({elements: [sourceCube], outliner: true});
-            sourceCube.from[state.mirrorAxis] += delta;
-            sourceCube.to[state.mirrorAxis] += delta;
-            sourceCube.origin[state.mirrorAxis] += delta;
+            const editAspects = {elements: [sourceCube], outliner: true};
+            Undo.initEdit(editAspects);
+            if (!translateCubeOnSingleAxis(sourceCube, state.mirrorAxis, delta)) throw new Error('Could not move cube on mirror axis');
             updateCubeGeometryNow(sourceCube);
-            Undo.finishEdit('SMS: Ecke an Spiegelachse ausrichten', {elements: [sourceCube], outliner: true});
+
+            // Plugin-triggered edits do not reliably emit Blockbench's normal
+            // finish_edit lifecycle in every 4.x/5.x build. Synchronize inside the
+            // same Undo transaction so the counterpart is guaranteed to exist.
+            synchronizeSmartMirrorInline({aspects: editAspects}, [sourceCube.uuid]);
+            Undo.finishEdit('SMS: Snap Corner to Mirror Plane', editAspects);
             quick(`Cube nur auf ${axisName()} verschoben · Gegenstück symmetrisch aktualisiert`, 3600);
             return true;
         } catch (e) {
@@ -1207,7 +1294,7 @@
             const side = featureMirrorSide(sourceFeature);
             if (state.smartMirrorEnabled && state.mirrorSingles.has(sourceCube.uuid)) setMirrorAuthority(sourceCube, side);
             updateCubeGeometryNow(sourceCube);
-            Undo.finishEdit('SMS: Kantenlänge übernehmen');
+            Undo.finishEdit('SMS: Match Edge Length');
             return true;
         } catch (e) {
             warn('Advanced edge length match failed', e);
@@ -1273,7 +1360,7 @@
                 }
             }
 
-            Undo.finishEdit('SMS: Kante zwischen Ecken einpassen');
+            Undo.finishEdit('SMS: Fit Edge Between Corners');
             return true;
         } catch (e) {
             warn('Advanced edge bridge failed', e);
@@ -1290,9 +1377,8 @@
             return;
         }
         let sourceCube = advancedSourceCube();
-        const event = data && data.event;
-        const shiftPressed = !!(event && event.shiftKey);
-        const altPressed = !!(event && event.altKey);
+        const shiftPressed = modifierPressed(data, 'shift');
+        const altPressed = modifierPressed(data, 'alt');
 
         if (!sourceCube) {
             if (hit.cube) {
@@ -1697,24 +1783,11 @@
         if (state.selectionGuard) return;
         const now = currentSelectionUUIDs();
 
-        if (state.stickySelection && now.length === 0 && !state.allowExplicitClear && state.stickySelectionSnapshot.length) {
-            state.selectionGuard = true;
-            setTimeout(() => {
-                try {
-                    restoreSelectionByUUIDs(state.stickySelectionSnapshot, false);
-                } finally {
-                    state.selectionGuard = false;
-                }
-            }, 0);
-            return;
-        }
-
         if (now.length > 0) {
             if (state.currentSelection.length && !sameUUIDSelection(now, state.currentSelection)) {
                 state.previousSelection = state.currentSelection.slice();
             }
             state.currentSelection = now.slice();
-            if (state.stickySelection) state.stickySelectionSnapshot = now.slice();
         } else if (state.currentSelection.length) {
             state.previousSelection = state.currentSelection.slice();
             state.currentSelection = [];
@@ -1739,32 +1812,7 @@
         const oldCurrent = state.currentSelection.slice();
         if (restoreSelectionByUUIDs(state.previousSelection, true)) {
             state.previousSelection = oldCurrent;
-            if (state.stickySelection) state.stickySelectionSnapshot = state.currentSelection.slice();
         }
-    }
-
-    function explicitClearSelection() {
-        state.allowExplicitClear = true;
-        state.selectionGuard = true;
-        try {
-            const now = currentSelectionUUIDs();
-            if (now.length) {
-                state.previousSelection = now.slice();
-                state.currentSelection = [];
-            }
-            if (typeof unselectAll === 'function') unselectAll();
-            else {
-                for (const el of (Outliner.selected || []).slice()) {
-                    try { el.unselect(); } catch (_) {}
-                }
-            }
-            state.stickySelectionSnapshot = [];
-            try { Canvas.updateView({selection: true}); } catch (_) {}
-        } finally {
-            state.selectionGuard = false;
-            setTimeout(() => { state.allowExplicitClear = false; }, 0);
-        }
-        quick('Auswahl explizit aufgehoben');
     }
 
     // --------------------------
@@ -2313,22 +2361,105 @@
         return {cubes, parent, min, max, spans, center, depthAxis, inPlaneAxes, currentThickness, referenceThickness};
     }
 
-    function bladeLayerScale(layerFraction, sharpnessPercent) {
+    function bladeDepthCurve(value, sharpnessPercent) {
         const sharpness = clampNumber(sharpnessPercent, 0, 100) / 100;
-        const maximumInset = 0.04 + 0.26 * sharpness;
-        const exponent = 2.8 - 2.0 * sharpness;
-        const inset = maximumInset * Math.pow(clampNumber(layerFraction, 0, 1), exponent);
-        return Math.max(0.2, 1 - inset);
+        const exponent = 1.35 - 0.75 * sharpness;
+        const normalized = clampNumber(value, 0, 1);
+        if (normalized <= 0.5) {
+            return 0.5 - 0.5 * Math.pow(1 - normalized * 2, exponent);
+        }
+        return 0.5 + 0.5 * Math.pow((normalized - 0.5) * 2, exponent);
     }
 
-    function applyBladeLayerTransform(cube, source, analysis, layerCenter, slabThickness, scale) {
+    function bladeLayerLayout(layersPerSide, finalThickness, sharpnessPercent) {
+        const count = layersPerSide * 2 + 1;
+        const boundaries = [];
+        for (let i = 0; i <= count; i++) {
+            boundaries.push((bladeDepthCurve(i / count, sharpnessPercent) - 0.5) * finalThickness);
+        }
+        const layers = [];
+        for (let i = 0; i < count; i++) {
+            const low = boundaries[i];
+            const high = boundaries[i + 1];
+            layers.push({
+                index: i,
+                offset: (low + high) / 2,
+                thickness: high - low,
+                fraction: finalThickness > EPS ? Math.abs((low + high) / finalThickness) * 2 : 0,
+            });
+        }
+        return layers;
+    }
+
+    function bladeLayerScale(layerFraction, sharpnessPercent) {
+        const sharpness = clampNumber(sharpnessPercent, 0, 100) / 100;
+        const maximumInset = 0.025 + 0.14 * sharpness;
+        const exponent = 2.4 - 1.25 * sharpness;
+        const distance = Math.pow(clampNumber(layerFraction, 0, 1), exponent);
+        const smoothDistance = distance * distance * (3 - 2 * distance);
+        const inset = maximumInset * smoothDistance;
+        return Math.max(0.5, 1 - inset);
+    }
+
+    function bladeAnchorOptions(analysis) {
+        const labels = {
+            '0:min': 'Left / X−',
+            '0:max': 'Right / X+',
+            '1:min': 'Bottom / Y−',
+            '1:max': 'Top / Y+',
+            '2:min': 'Back / Z−',
+            '2:max': 'Front / Z+',
+        };
+        const options = {};
+        for (const axis of analysis.inPlaneAxes) {
+            options[`${axis}:min`] = labels[`${axis}:min`];
+            options[`${axis}:max`] = labels[`${axis}:max`];
+        }
+        return options;
+    }
+
+    function defaultBladeAnchor(analysis) {
+        if (analysis.inPlaneAxes.includes(1)) return '1:min';
+        return `${analysis.inPlaneAxes[analysis.inPlaneAxes.length - 1]}:min`;
+    }
+
+    function parseBladeAnchor(analysis, anchorKey) {
+        const parts = String(anchorKey || defaultBladeAnchor(analysis)).split(':');
+        const axis = Number(parts[0]);
+        const side = parts[1] === 'max' ? 'max' : 'min';
+        if (!analysis.inPlaneAxes.includes(axis)) {
+            return parseBladeAnchor(analysis, defaultBladeAnchor(analysis));
+        }
+        return {axis, side};
+    }
+
+    function applyBladeLayerTransform(cube, source, analysis, layerCenter, slabThickness, scale, anchorKey) {
         const depthAxis = analysis.depthAxis;
+        const anchor = parseBladeAnchor(analysis, anchorKey);
+        const anchorCoordinate = anchor.side === 'max' ? analysis.max[anchor.axis] : analysis.min[anchor.axis];
+        const anchorSpan = Math.max(EPS, analysis.spans[anchor.axis]);
+        const sourceNearCoordinate = anchor.side === 'max'
+            ? Math.max(source.from[anchor.axis], source.to[anchor.axis])
+            : Math.min(source.from[anchor.axis], source.to[anchor.axis]);
+        const sourceDistance = Math.abs(sourceNearCoordinate - anchorCoordinate) / anchorSpan;
+        const attachmentWeight = clampNumber(sourceDistance, 0, 1);
+        const attachmentEase = attachmentWeight * attachmentWeight * (3 - 2 * attachmentWeight);
+
         for (let axis = 0; axis < 3; axis++) {
             if (axis === depthAxis) continue;
-            const pivot = analysis.center[axis];
-            cube.from[axis] = pivot + (source.from[axis] - pivot) * scale;
-            cube.to[axis] = pivot + (source.to[axis] - pivot) * scale;
-            cube.origin[axis] = pivot + (source.origin[axis] - pivot) * scale;
+            if (axis === anchor.axis) {
+                cube.from[axis] = anchorCoordinate + (source.from[axis] - anchorCoordinate) * scale;
+                cube.to[axis] = anchorCoordinate + (source.to[axis] - anchorCoordinate) * scale;
+                cube.origin[axis] = anchorCoordinate + (source.origin[axis] - anchorCoordinate) * scale;
+            } else {
+                // Cubes that touch the fixed side retain their full parallel width.
+                // Farther cubes progressively receive the requested layer inset.
+                const parallelScale = 1 - (1 - scale) * attachmentEase;
+                const pivot = analysis.center[axis];
+                cube.from[axis] = pivot + (source.from[axis] - pivot) * parallelScale;
+                cube.to[axis] = pivot + (source.to[axis] - pivot) * parallelScale;
+                cube.origin[axis] = pivot + (source.origin[axis] - pivot) * parallelScale;
+            }
         }
 
         const sourceDepthCenter = (source.from[depthAxis] + source.to[depthAxis]) / 2;
@@ -2337,18 +2468,84 @@
         cube.origin[depthAxis] = source.origin[depthAxis] + (layerCenter - sourceDepthCenter);
     }
 
+    function showCubeCreationConfirmation(count, title, message, onConfirm) {
+        if (typeof Blockbench !== 'undefined' && typeof Blockbench.showMessageBox === 'function') {
+            Blockbench.showMessageBox({
+                title,
+                message,
+                buttons: ['Erzeugen', 'Abbrechen'],
+                confirm: 0,
+                cancel: 1,
+            }, result => {
+                if (result === 0 || result === 'Erzeugen') onConfirm();
+            });
+            return;
+        }
+        new Dialog({
+            id: `sms_cube_count_${count}_${Date.now()}`,
+            title,
+            lines: [message],
+            buttons: ['Erzeugen', 'Abbrechen'],
+            confirmIndex: 0,
+            cancelIndex: 1,
+            onConfirm,
+        }).show();
+    }
+
+    function requestBulkCubeCreation(count, onApproved) {
+        if (!Number.isFinite(count) || count < 0) return false;
+        if (count >= 1000) {
+            if (typeof Blockbench !== 'undefined' && typeof Blockbench.showMessageBox === 'function') {
+                Blockbench.showMessageBox({
+                    title: 'SMS: Cube Limit',
+                    message: `${count} neue Cubes würden erzeugt. Ab 1000 Cubes wird der Vorgang zum Schutz des Projekts nicht ausgeführt.`,
+                    buttons: ['OK'],
+                });
+            } else {
+                quick(`Abgebrochen: ${count} neue Cubes überschreiten das Limit von 999`, 5600);
+            }
+            return false;
+        }
+
+        const confirmations = [];
+        if (count > 100) {
+            confirmations.push({
+                title: 'SMS: Create Many Cubes?',
+                message: `Dieser Vorgang erzeugt ${count} neue Cubes. Das kann Blockbench verlangsamen. Wirklich fortfahren?`,
+            });
+        }
+        if (count >= 500) {
+            confirmations.push({
+                title: 'SMS: Second Confirmation Required',
+                message: `${count} neue Cubes sind eine sehr große Änderung. Möchtest du sie wirklich jetzt erzeugen?`,
+            });
+        }
+
+        const next = () => {
+            const confirmation = confirmations.shift();
+            if (!confirmation) {
+                onApproved();
+                return;
+            }
+            showCubeCreationConfirmation(count, confirmation.title, confirmation.message, next);
+        };
+        next();
+        return true;
+    }
+
     function createDetailedBlade(analysis, options) {
         const layersPerSide = Math.round(clampNumber(options.layersPerSide, 1, 16));
         const finalThickness = clampNumber(options.finalThickness, 0.01, 128);
         const sharpness = clampNumber(options.sharpness, 0, 100);
         const totalLayerCount = layersPerSide * 2 + 1;
         const createdCount = analysis.cubes.length * layersPerSide * 2;
-        if (createdCount > 2400) {
-            quick(`Abgebrochen: ${createdCount} neue Cubes wären zu viel · weniger Layer oder Cubes wählen`, 5200);
+        if (createdCount >= 1000) {
+            quick(`Abgebrochen: ${createdCount} neue Cubes überschreiten das Limit von 999`, 5200);
             return false;
         }
 
-        const slabThickness = finalThickness / totalLayerCount;
+        const layerLayout = bladeLayerLayout(layersPerSide, finalThickness, sharpness);
+        const centerLayer = layerLayout[layersPerSide];
         const sources = analysis.cubes.map(cube => ({
             cube,
             from: cube.from.slice(),
@@ -2365,18 +2562,27 @@
             Undo.initEdit({elements: analysis.cubes.slice(), outliner: true});
             editOpen = true;
 
-            // The existing profile becomes the exact middle layer. Every new layer is
-            // placed at the same distance on both sides, so the result cannot drift.
+            // The existing profile becomes the exact middle layer. Curved, symmetric
+            // boundaries give every following layer its own thickness without gaps.
             for (const source of sources) {
-                applyBladeLayerTransform(source.cube, source, analysis, analysis.center[analysis.depthAxis], slabThickness, 1);
+                applyBladeLayerTransform(
+                    source.cube,
+                    source,
+                    analysis,
+                    analysis.center[analysis.depthAxis] + centerLayer.offset,
+                    centerLayer.thickness,
+                    1,
+                    options.anchorSide
+                );
                 updateCubeGeometryNow(source.cube);
             }
 
             for (let layer = 1; layer <= layersPerSide; layer++) {
-                const fraction = layer / layersPerSide;
-                const scale = bladeLayerScale(fraction, sharpness);
                 for (const side of [-1, 1]) {
-                    const layerCenter = analysis.center[analysis.depthAxis] + side * layer * slabThickness;
+                    const layoutIndex = layersPerSide + side * layer;
+                    const layout = layerLayout[layoutIndex];
+                    const scale = bladeLayerScale(layout.fraction, sharpness);
+                    const layerCenter = analysis.center[analysis.depthAxis] + layout.offset;
                     for (const source of sources) {
                         const copy = source.cube.duplicate();
                         if (!copy || copy.type !== 'cube') throw new Error('Cube duplication failed');
@@ -2385,7 +2591,7 @@
                             const uniqueName = copy.createUniqueName && copy.createUniqueName();
                             if (uniqueName) copy.name = uniqueName;
                         } catch (_) {}
-                        applyBladeLayerTransform(copy, source, analysis, layerCenter, slabThickness, scale);
+                        applyBladeLayerTransform(copy, source, analysis, layerCenter, layout.thickness, scale, options.anchorSide);
                         updateCubeGeometryNow(copy);
                         created.push(copy);
                     }
@@ -2393,7 +2599,7 @@
             }
 
             const allAffected = analysis.cubes.concat(created);
-            Undo.finishEdit('SMS: Detaillierte Klinge erzeugen', {elements: allAffected, outliner: true});
+            Undo.finishEdit('SMS: Detailed Blade', {elements: allAffected, outliner: true});
             editOpen = false;
             state.mirrorGuard = oldMirrorGuard;
 
@@ -2436,7 +2642,7 @@
         let dialog = null;
         dialog = new Dialog({
             id: 'smart_modeling_detailed_blade',
-            title: 'SMS: Detaillierte Klinge erzeugen',
+            title: 'SMS: Detailed Blade',
             form: {
                 selection_info: {
                     label: 'Erkannte Ausgangsform',
@@ -2466,6 +2672,12 @@
                         ? `100 % = ${analysis.referenceThickness.toFixed(3)} Cube-Einheiten Ausgangsdicke.`
                         : 'Das Ausgangsprofil ist 0 dick; deshalb entsprechen hier 100 % genau 1 Cube-Einheit.'
                 },
+                anchor_side: {
+                    label: 'Unveränderte Griffkante',
+                    type: 'select',
+                    value: defaultBladeAnchor(analysis),
+                    options: bladeAnchorOptions(analysis),
+                },
                 sharpness: {
                     label: 'Klingenschärfe / äußere Steilheit (%)',
                     type: 'number',
@@ -2485,7 +2697,7 @@
                 layer_info: {
                     label: 'Layer-Ergebnis',
                     type: 'info',
-                    text: 'Bei 4 Layern je Seite entstehen 8 neue Layer plus die vorhandene Mittelschicht.'
+                    text: 'Die Layer bleiben lückenlos, erhalten aber je nach Schärfe unterschiedliche Tiefenabstände und Dicken.'
                 },
             },
             onFormChange(result) {
@@ -2507,11 +2719,15 @@
                 syncing = false;
             },
             onConfirm(result) {
-                createDetailedBlade(analysis, {
+                const options = {
                     finalThickness: Number(result.final_thickness_units),
                     sharpness: Number(result.sharpness),
                     layersPerSide: Number(result.layers_per_side),
-                });
+                    anchorSide: result.anchor_side,
+                };
+                const layersPerSide = Math.round(clampNumber(options.layersPerSide, 1, 16));
+                const createdCount = analysis.cubes.length * layersPerSide * 2;
+                requestBulkCubeCreation(createdCount, () => createDetailedBlade(analysis, options));
             }
         });
         dialog.show();
@@ -2524,7 +2740,7 @@
     function openMirrorSettings() {
         new Dialog({
             id: 'smart_modeling_mirror_settings',
-            title: 'SMS: Spiegelmodellierung – Einstellungen',
+            title: 'SMS: Smart Mirror Settings',
             form: {
                 axis: {
                     label: 'Spiegelachse',
@@ -2611,7 +2827,7 @@
             installCSS();
 
             const smartMirrorToggle = new Toggle('sms_smart_mirror_modeling', {
-                name: 'SMS: Intelligente Spiegelmodellierung',
+                name: 'SMS: Smart Mirror Modeling',
                 description: 'Kontinuierlicher Mirror-Modeling-Modus bei Koordinate 8. Neue Cubes, Größenänderungen, Bewegung, Rotation, Löschen und Vertex Snap werden automatisch gespiegelt; die angefasste Seite bleibt dabei unverändert.',
                 icon: 'compare_arrows',
                 value: false,
@@ -2635,14 +2851,14 @@
             addAction(smartMirrorToggle);
 
             addAction(new Action('sms_mirror_settings', {
-                name: 'SMS: Spiegelachse festlegen',
+                name: 'SMS: Set Mirror Axis',
                 description: 'X, Y oder Z wählen. Die Spiegelebene liegt immer bei Koordinate 8.',
                 icon: 'settings',
                 click: openMirrorSettings
             }), false);
 
             const advancedVertexTool = new Tool('sms_advanced_vertex_mode', {
-                name: 'SMS: Intelligentes Eck-/Kanten-Snapping',
+                name: 'SMS: Smart Vertex/Edge Snap',
                 description: 'Ecke auf Ecke verschieben, mit Alt eine Ecke an der Spiegelachse ausrichten oder Kanten direkt beziehungsweise mit Umschalt + zwei benachbarten Ecken wählen.',
                 icon: 'icon-vertexsnap',
                 category: 'tools',
@@ -2682,7 +2898,7 @@
             addAction(advancedVertexTool);
 
             addAction(new Action('sms_check_duplicates', {
-                name: 'SMS: Exakte Duplikate prüfen',
+                name: 'SMS: Check Exact Duplicates',
                 description: 'Findet nur Cubes mit exakt identischem from/to, Pivot und Rotation. Treffer bleiben im frei drehbaren Modell rot markiert.',
                 icon: 'content_copy',
                 condition: () => !!Project && Cube.all && Cube.all.length > 1,
@@ -2690,7 +2906,7 @@
             }));
 
             addAction(new Action('sms_optimize_texture', {
-                name: 'SMS: Textur verlustfrei optimieren',
+                name: 'SMS: Lossless Texture Optimizer',
                 description: 'Packt verwendete UV-Pixel neu, verwendet identische Pixelmuster gemeinsam und übernimmt Box UV automatisch in per-face UV.',
                 icon: 'auto_awesome',
                 condition: () => !!Project && Texture.all && Texture.all.length > 0,
@@ -2698,7 +2914,7 @@
             }));
 
             addAction(new Action('sms_create_detailed_blade', {
-                name: 'SMS: Detaillierte Klinge erzeugen',
+                name: 'SMS: Detailed Blade',
                 description: 'Erzeugt aus einer geraden, symmetrischen Auswahl flacher Cubes beidseitige, zunehmend verjüngte Tiefen-Layer. Enddicke, Klingenschärfe und Layerzahl sind einstellbar.',
                 icon: 'content_cut',
                 condition: () => !!Project && Cube.selected && Cube.selected.length >= 2,
@@ -2706,39 +2922,10 @@
             }));
 
             addAction(new Action('sms_restore_selection', {
-                name: 'SMS: Vorherige Auswahl wiederherstellen',
+                name: 'SMS: Restore Previous Selection',
                 description: 'Stellt die komplette vorherige Mehrfachauswahl wieder her.',
                 icon: 'history',
                 click: restorePreviousSelection
-            }));
-
-            const stickyToggle = new Toggle('sms_sticky_selection', {
-                name: 'SMS: Auswahl gegen Leerklick sperren',
-                description: 'Verhindert, dass ein Klick in den leeren 3D-Raum die komplette Auswahl aufhebt. Andere Cubes können weiterhin bewusst ausgewählt werden.',
-                icon: 'push_pin',
-                value: false,
-                onChange(value) {
-                    state.stickySelection = !!value;
-                    if (value) {
-                        const now = currentSelectionUUIDs();
-                        if (now.length) {
-                            state.currentSelection = now.slice();
-                            state.stickySelectionSnapshot = now.slice();
-                        }
-                        quick('SMS-Auswahlsperre AN · Leerklicks heben die Auswahl nicht mehr auf');
-                    } else {
-                        state.stickySelectionSnapshot = [];
-                        quick('SMS-Auswahlsperre AUS');
-                    }
-                }
-            });
-            addAction(stickyToggle);
-
-            addAction(new Action('sms_clear_selection', {
-                name: 'SMS: Auswahl bewusst aufheben',
-                description: 'Hebt die Auswahl auch bei eingeschalteter SMS-Auswahlsperre vollständig auf.',
-                icon: 'deselect',
-                click: explicitClearSelection
             }));
 
             addListener('update_selection', onSelectionUpdate);
@@ -2757,7 +2944,6 @@
                 state.mirrorAuthority.clear();
                 state.currentSelection = currentSelectionUUIDs();
                 state.previousSelection = [];
-                state.stickySelectionSnapshot = state.stickySelection ? state.currentSelection.slice() : [];
                 if (state.smartMirrorEnabled) disableNativeMirrorForProject();
                 rebuildMirrorPairs();
             });
