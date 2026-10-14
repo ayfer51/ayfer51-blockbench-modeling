@@ -1,6 +1,6 @@
 /*
  * Smart Modeling Suite for Blockbench
- * Version 0.4.0
+ * Version 0.5.0
  *
  * Features:
  *  - Smart Mirror Modeling for cubes (X/Y/Z mirror planes)
@@ -8,7 +8,8 @@
  *  - Safe texture optimizer with exact pixel reuse + lossless solid/scaled-pattern reduction
  *  - Restore previous selection
  *  - Sticky selection mode + explicit clear button
- *  - Advanced Vertex Mode with clickable cube edges and two edge-fitting workflows
+ *  - Smart Vertex Snap with corner movement, mirror-plane alignment and edge workflows
+ *  - Symmetric layered 3D blade generator for flat cube profiles
  *
  * This plugin is designed to be Minecraft-version agnostic. It works on Blockbench cubes,
  * UVs and textures rather than targeting a specific Minecraft release.
@@ -16,7 +17,7 @@
 
 (function() {
     const PLUGIN_ID = 'smart_modeling_suite';
-    const VERSION = '0.4.0';
+    const VERSION = '0.5.0';
     const EPS = 1e-7;
 
     let actions = [];
@@ -40,9 +41,11 @@
 
         advancedVertex: {
             sourceCubeUUID: null,
+            sourceVertex: null,
             sourceEdge: null,
+            sourceEdgeVertexA: null,
             targetVertexA: null,
-            stage: 'source_edge',
+            stage: 'source_feature',
         },
 
         duplicateReview: null,
@@ -190,6 +193,12 @@
         const min = Math.min(cube.from[axis], cube.to[axis]);
         const max = Math.max(cube.from[axis], cube.to[axis]);
         return min <= plane + EPS && max >= plane - EPS;
+    }
+
+    function cubeLocalCrossesPlane(cube, axis = state.mirrorAxis, plane = state.mirrorPlane) {
+        const min = Math.min(cube.from[axis], cube.to[axis]);
+        const max = Math.max(cube.from[axis], cube.to[axis]);
+        return min < plane - EPS && max > plane + EPS;
     }
 
     function cubeIsLocallySymmetric(cube, axis = state.mirrorAxis, plane = state.mirrorPlane) {
@@ -543,7 +552,10 @@
                 let partnerUUID = state.mirrorPairs.get(cube.uuid);
                 let partner = partnerUUID ? currentByUUID.get(partnerUUID) : null;
 
-                const canBeOneCube = cubeCanBeSingleSymmetricCube(cube) && cubeLocalIntersectsPlane(cube);
+                // Merely touching the mirror plane with one face must stay a two-cube
+                // pair. Only a cube that actually crosses the plane may collapse into
+                // one symmetric cube. This is essential for mirror-plane vertex snap.
+                const canBeOneCube = cubeCanBeSingleSymmetricCube(cube) && cubeLocalCrossesPlane(cube);
                 if (canBeOneCube) {
                     pushAspectElement(data, cube);
                     if (partner && partner !== cube) {
@@ -680,9 +692,9 @@
         const uuids = cubes.map(c => c.uuid);
         try {
             Undo.initEdit({elements: cubes.slice(), outliner: true});
-            const fake = {aspects: {elements: cubes.slice(), outliner: true}, message: 'Smart Mirror anwenden'};
+            const fake = {aspects: {elements: cubes.slice(), outliner: true}, message: 'SMS: Spiegelung anwenden'};
             synchronizeSmartMirrorInline(fake, uuids);
-            Undo.finishEdit('Smart Mirror anwenden', fake.aspects);
+            Undo.finishEdit('SMS: Spiegelung anwenden', fake.aspects);
             if (!options.silent) quick(`${cubes.length} Cube(s) mit Smart Mirror synchronisiert`);
         } catch (e) {
             warn('Manual Smart Mirror failed', e);
@@ -713,20 +725,52 @@
     }
 
     function getCubeFeatureGeometry(cube) {
-        if (!cube || !cube.mesh || !cube.mesh.geometry || !cube.mesh.geometry.attributes || !cube.mesh.geometry.attributes.position || typeof THREE === 'undefined') {
+        if (!cube || !cube.mesh || typeof THREE === 'undefined') {
             return null;
         }
         try { cube.mesh.updateMatrixWorld(true); } catch (_) {}
-        const attr = cube.mesh.geometry.attributes.position;
         const unique = [];
         const byKey = new Map();
-        for (let i = 0; i < attr.count; i++) {
-            const local = new THREE.Vector3().fromBufferAttribute(attr, i);
-            const key = `${quantizeFeatureNumber(local.x)}|${quantizeFeatureNumber(local.y)}|${quantizeFeatureNumber(local.z)}`;
-            if (byKey.has(key)) continue;
-            const vertex = {local, world: local.clone().applyMatrix4(cube.mesh.matrixWorld), signs: [0, 0, 0]};
-            byKey.set(key, vertex);
-            unique.push(vertex);
+
+        // Blockbench exposes the eight transformed cube corners directly. Prefer this
+        // API because it also works when the preview mesh uses indexed or optimized
+        // geometry. The mesh-buffer fallback keeps compatibility with older 4.x builds.
+        try {
+            if (typeof cube.getGlobalVertexPositions === 'function') {
+                const positions = cube.getGlobalVertexPositions();
+                if (Array.isArray(positions) && positions.length >= 8) {
+                    const inverse = cube.mesh.matrixWorld.clone().invert();
+                    for (const position of positions) {
+                        if (!position || position.length < 3) continue;
+                        const world = new THREE.Vector3(Number(position[0]), Number(position[1]), Number(position[2]));
+                        if (![world.x, world.y, world.z].every(Number.isFinite)) continue;
+                        const local = world.clone().applyMatrix4(inverse);
+                        const key = `${quantizeFeatureNumber(local.x)}|${quantizeFeatureNumber(local.y)}|${quantizeFeatureNumber(local.z)}`;
+                        if (byKey.has(key)) continue;
+                        const vertex = {local, world, signs: [0, 0, 0]};
+                        byKey.set(key, vertex);
+                        unique.push(vertex);
+                    }
+                }
+            }
+        } catch (e) {
+            warn('Could not use Blockbench cube corner API', e);
+        }
+
+        if (unique.length < 8) {
+            unique.length = 0;
+            byKey.clear();
+            const geometry = cube.mesh.geometry;
+            const attr = geometry && geometry.attributes && geometry.attributes.position;
+            if (!attr) return null;
+            for (let i = 0; i < attr.count; i++) {
+                const local = new THREE.Vector3().fromBufferAttribute(attr, i);
+                const key = `${quantizeFeatureNumber(local.x)}|${quantizeFeatureNumber(local.y)}|${quantizeFeatureNumber(local.z)}`;
+                if (byKey.has(key)) continue;
+                const vertex = {local, world: local.clone().applyMatrix4(cube.mesh.matrixWorld), signs: [0, 0, 0]};
+                byKey.set(key, vertex);
+                unique.push(vertex);
+            }
         }
         if (unique.length < 8) return null;
 
@@ -789,13 +833,40 @@
         if (!data) return null;
         if (data.cube && data.cube.type === 'cube') return data.cube;
         if (data.element && data.element.type === 'cube') return data.element;
+        let object = data.intersect && data.intersect.object;
+        while (object) {
+            const cube = Cube && Cube.all ? Cube.all.find(candidate => candidate && candidate.mesh === object) : null;
+            if (cube) return cube;
+            object = object.parent;
+        }
+        return null;
+    }
+
+    function vectorFromRaycastValue(value) {
+        if (!value || typeof THREE === 'undefined') return null;
+        if (typeof value.clone === 'function' && Number.isFinite(value.x) && Number.isFinite(value.y) && Number.isFinite(value.z)) return value.clone();
+        if (Array.isArray(value) && value.length >= 3) {
+            const vector = new THREE.Vector3(Number(value[0]), Number(value[1]), Number(value[2]));
+            return [vector.x, vector.y, vector.z].every(Number.isFinite) ? vector : null;
+        }
+        if (Number.isFinite(value.x) && Number.isFinite(value.y) && Number.isFinite(value.z)) return new THREE.Vector3(value.x, value.y, value.z);
         return null;
     }
 
     function getRaycastPoint(data) {
-        if (data && data.intersect && data.intersect.point && typeof data.intersect.point.clone === 'function') return data.intersect.point.clone();
-        if (data && Array.isArray(data.vertex) && data.vertex.length >= 3 && typeof THREE !== 'undefined') {
-            return new THREE.Vector3(data.vertex[0], data.vertex[1], data.vertex[2]);
+        if (!data) return null;
+        const direct = vectorFromRaycastValue(data.intersect && data.intersect.point) || vectorFromRaycastValue(data.vertex);
+        if (direct) return direct;
+        if (Array.isArray(data.intersects)) {
+            for (const intersection of data.intersects) {
+                const point = vectorFromRaycastValue(intersection && intersection.point);
+                if (point) return point;
+            }
+        }
+        if (Array.isArray(data.vertices) && data.vertices.length === 2) {
+            const a = vectorFromRaycastValue(data.vertices[0]);
+            const b = vectorFromRaycastValue(data.vertices[1]);
+            if (a && b) return a.add(b).multiplyScalar(0.5);
         }
         return null;
     }
@@ -821,7 +892,7 @@
             return {type: 'vertex', cube, vertex, geometry};
         }
 
-        if (data.type === 'line' || data.type === 'edge') {
+        if (data.type === 'line' || data.type === 'edge' || (Array.isArray(data.vertices) && data.vertices.length === 2)) {
             if (!point) return null;
             let edge = null;
             let bestDistance = Infinity;
@@ -850,6 +921,29 @@
 
     function cloneEdgeDescriptor(edge) {
         return edge ? {axis: edge.axis, fixedSigns: edge.fixedSigns.slice(), key: edge.key} : null;
+    }
+
+    function cloneVertexDescriptor(vertex) {
+        return vertex ? {signs: vertex.signs.slice()} : null;
+    }
+
+    function findEquivalentCubeVertex(cube, descriptor) {
+        const geometry = getCubeFeatureGeometry(cube);
+        if (!geometry || !descriptor || !Array.isArray(descriptor.signs)) return null;
+        return geometry.vertices.find(vertex => vertex.signs.every((sign, axis) => sign === descriptor.signs[axis])) || null;
+    }
+
+    function edgeDescriptorFromVertexPair(first, second) {
+        if (!first || !second || !Array.isArray(first.signs) || !Array.isArray(second.signs)) return null;
+        const differing = [];
+        for (let axis = 0; axis < 3; axis++) {
+            if (first.signs[axis] !== second.signs[axis]) differing.push(axis);
+        }
+        if (differing.length !== 1) return null;
+        const axis = differing[0];
+        const fixedSigns = [null, null, null];
+        for (let i = 0; i < 3; i++) if (i !== axis) fixedSigns[i] = first.signs[i];
+        return {axis, fixedSigns, key: `${axis}:${fixedSigns.map(value => value === null ? '*' : value).join(',')}`};
     }
 
     function featureMirrorSide(feature) {
@@ -977,9 +1071,11 @@
 
     function resetAdvancedVertexOperation(keepSource = true) {
         if (!keepSource) state.advancedVertex.sourceCubeUUID = null;
+        state.advancedVertex.sourceVertex = null;
         state.advancedVertex.sourceEdge = null;
+        state.advancedVertex.sourceEdgeVertexA = null;
         state.advancedVertex.targetVertexA = null;
-        state.advancedVertex.stage = 'source_edge';
+        state.advancedVertex.stage = 'source_feature';
     }
 
     function worldLengthOfEdge(edge) {
@@ -1022,6 +1118,60 @@
         return true;
     }
 
+    function moveSourceVertexToTarget(sourceCube, sourceDescriptor, targetVertex) {
+        if (!sourceCube || !sourceDescriptor || !targetVertex || !targetVertex.world) return false;
+        const sourceVertex = findEquivalentCubeVertex(sourceCube, sourceDescriptor);
+        if (!sourceVertex) {
+            quick('Die gewählte Quellecke existiert nicht mehr');
+            return false;
+        }
+        try {
+            Undo.initEdit({elements: [sourceCube], outliner: !!state.smartMirrorEnabled});
+            if (!translateCubeWorld(sourceCube, sourceVertex.world, targetVertex.world)) throw new Error('Could not translate source corner');
+            updateCubeGeometryNow(sourceCube);
+            Undo.finishEdit('SMS: Ecke auf Ecke verschieben', {elements: [sourceCube], outliner: !!state.smartMirrorEnabled});
+            return true;
+        } catch (e) {
+            warn('Smart corner snap failed', e);
+            try { Undo.cancelEdit(true); } catch (_) {}
+            quick('Die Ecke konnte nicht verschoben werden');
+            return false;
+        }
+    }
+
+    function moveSourceVertexToMirrorPlane(sourceCube, sourceDescriptor) {
+        if (!state.smartMirrorEnabled) {
+            quick('Dafür muss die SMS-Spiegelmodellierung aktiv sein');
+            return false;
+        }
+        const sourceVertex = findEquivalentCubeVertex(sourceCube, sourceDescriptor);
+        if (!sourceVertex || !sourceCube.mesh || !sourceCube.mesh.parent) {
+            quick('Die gewählte Ecke konnte nicht bestimmt werden');
+            return false;
+        }
+        try {
+            sourceCube.mesh.parent.updateMatrixWorld(true);
+            const localVertex = sourceCube.mesh.parent.worldToLocal(sourceVertex.world.clone());
+            const coordinate = [localVertex.x, localVertex.y, localVertex.z][state.mirrorAxis];
+            const delta = state.mirrorPlane - coordinate;
+            if (!Number.isFinite(delta)) throw new Error('Invalid mirror-axis offset');
+
+            Undo.initEdit({elements: [sourceCube], outliner: true});
+            sourceCube.from[state.mirrorAxis] += delta;
+            sourceCube.to[state.mirrorAxis] += delta;
+            sourceCube.origin[state.mirrorAxis] += delta;
+            updateCubeGeometryNow(sourceCube);
+            Undo.finishEdit('SMS: Ecke an Spiegelachse ausrichten', {elements: [sourceCube], outliner: true});
+            quick(`Cube nur auf ${axisName()} verschoben · Gegenstück symmetrisch aktualisiert`, 3600);
+            return true;
+        } catch (e) {
+            warn('Mirror-plane corner snap failed', e);
+            try { Undo.cancelEdit(true); } catch (_) {}
+            quick('Die Ecke konnte nicht an der Spiegelachse ausgerichtet werden');
+            return false;
+        }
+    }
+
     function rotateCubeWorldDirection(cube, sourceDirection, targetDirection) {
         if (!cube || !cube.mesh || !sourceDirection || !targetDirection || sourceDirection.lengthSq() <= EPS || targetDirection.lengthSq() <= EPS) return false;
         try { cube.mesh.updateMatrixWorld(true); } catch (_) {}
@@ -1057,7 +1207,7 @@
             const side = featureMirrorSide(sourceFeature);
             if (state.smartMirrorEnabled && state.mirrorSingles.has(sourceCube.uuid)) setMirrorAuthority(sourceCube, side);
             updateCubeGeometryNow(sourceCube);
-            Undo.finishEdit('Advanced Vertex: Kantenlänge übernehmen');
+            Undo.finishEdit('SMS: Kantenlänge übernehmen');
             return true;
         } catch (e) {
             warn('Advanced edge length match failed', e);
@@ -1123,7 +1273,7 @@
                 }
             }
 
-            Undo.finishEdit('Advanced Vertex: Kante zwischen Ecken einpassen');
+            Undo.finishEdit('SMS: Kante zwischen Ecken einpassen');
             return true;
         } catch (e) {
             warn('Advanced edge bridge failed', e);
@@ -1135,28 +1285,54 @@
 
     function handleAdvancedVertexClick(data) {
         const hit = resolveCubeFeatureHit(data);
-        if (!hit) return;
+        if (!hit) {
+            quick('Keine Ecke oder Kante erkannt · näher an einen Griffpunkt klicken');
+            return;
+        }
         let sourceCube = advancedSourceCube();
+        const event = data && data.event;
+        const shiftPressed = !!(event && event.shiftKey);
+        const altPressed = !!(event && event.altKey);
 
         if (!sourceCube) {
             if (hit.cube) {
                 selectOnlyCubes([hit.cube]);
                 state.advancedVertex.sourceCubeUUID = hit.cube.uuid;
                 resetAdvancedVertexOperation(true);
-                quick('Cube gewählt - jetzt eine Quellkante anklicken');
+                quick('Quell-Cube gewählt · jetzt Ecke oder Kante anklicken');
             }
             return;
         }
 
-        if (state.advancedVertex.stage === 'source_edge') {
-            // Corner -> corner keeps the complete normal Blockbench Vertex Snap
-            // behavior. Edge -> ... enters the additional Advanced Vertex workflow.
+        if (state.advancedVertex.stage === 'source_feature') {
             if (hit.type === 'vertex') {
-                handleNativeVertexSnapInsideAdvancedMode(data, hit);
+                if (hit.cube !== sourceCube) {
+                    quick('Die erste Ecke muss zum ausgewählten Quell-Cube gehören');
+                    return;
+                }
+                if (shiftPressed) {
+                    state.advancedVertex.sourceEdgeVertexA = cloneVertexDescriptor(hit.vertex);
+                    state.advancedVertex.stage = 'source_edge_second_vertex';
+                    quick('Erster Kantenpunkt gewählt · mit Umschalt die benachbarte Ecke anklicken', 3600);
+                    return;
+                }
+                const descriptor = cloneVertexDescriptor(hit.vertex);
+                if (altPressed) {
+                    if (moveSourceVertexToMirrorPlane(sourceCube, descriptor)) {
+                        resetAdvancedVertexOperation(true);
+                        refreshNativeVertexSnapGizmos();
+                    }
+                    return;
+                }
+                state.advancedVertex.sourceVertex = descriptor;
+                state.advancedVertex.stage = 'target_vertex';
+                quick(state.smartMirrorEnabled
+                    ? 'Quellecke gewählt · jetzt Zielecke anklicken · Alt+Klick auf die Quellecke richtet sie direkt an der Spiegelachse aus'
+                    : 'Quellecke gewählt · jetzt eine Zielecke anklicken', 5200);
                 return;
             }
             if (hit.type !== 'edge') {
-                quick('Eine Ecke für normales Vertex Snap oder eine Quellkante anklicken');
+                quick('Eine Quellecke oder Quellkante anklicken');
                 return;
             }
             if (hit.cube !== sourceCube) {
@@ -1170,6 +1346,47 @@
             state.advancedVertex.sourceEdge = cloneEdgeDescriptor(hit.edge);
             state.advancedVertex.stage = 'target_choice';
             quick('Quellkante gewählt - jetzt Zielkante ODER erste Zielecke anklicken', 3600);
+            return;
+        }
+
+        if (state.advancedVertex.stage === 'source_edge_second_vertex') {
+            if (hit.type !== 'vertex' || hit.cube !== sourceCube) {
+                quick('Bitte eine benachbarte zweite Ecke desselben Quell-Cubes anklicken');
+                return;
+            }
+            const descriptor = edgeDescriptorFromVertexPair(state.advancedVertex.sourceEdgeVertexA, hit.vertex);
+            if (!descriptor) {
+                quick('Diese beiden Ecken bilden keine direkte Cube-Kante');
+                return;
+            }
+            state.advancedVertex.sourceEdge = descriptor;
+            state.advancedVertex.sourceEdgeVertexA = null;
+            state.advancedVertex.stage = 'target_choice';
+            quick('Quellkante über zwei Ecken gewählt · jetzt Zielkante oder erste Zielecke anklicken', 4200);
+            return;
+        }
+
+        if (state.advancedVertex.stage === 'target_vertex') {
+            if (altPressed && state.advancedVertex.sourceVertex) {
+                if (moveSourceVertexToMirrorPlane(sourceCube, state.advancedVertex.sourceVertex)) {
+                    resetAdvancedVertexOperation(true);
+                    refreshNativeVertexSnapGizmos();
+                }
+                return;
+            }
+            if (hit.type !== 'vertex') {
+                quick('Als Ziel bitte eine Ecke anklicken');
+                return;
+            }
+            if (hit.cube === sourceCube) {
+                quick('Die Zielecke muss zu einem anderen Cube gehören');
+                return;
+            }
+            if (moveSourceVertexToTarget(sourceCube, state.advancedVertex.sourceVertex, hit.vertex)) {
+                resetAdvancedVertexOperation(true);
+                refreshNativeVertexSnapGizmos();
+                quick('Quellecke auf Zielecke verschoben · Größe und Rotation unverändert');
+            }
             return;
         }
 
@@ -1209,6 +1426,7 @@
             };
             if (fitSourceEdgeBetweenVertices(sourceCube, state.advancedVertex.sourceEdge, state.advancedVertex.targetVertexA, targetB)) {
                 resetAdvancedVertexOperation(true);
+                refreshNativeVertexSnapGizmos();
                 quick('Kante exakt zwischen den beiden Ecken eingepasst');
             }
         }
@@ -1505,7 +1723,7 @@
         // While waiting for a new source edge, an explicit selection in the outliner or
         // viewport should immediately become the Advanced Vertex source cube.
         try {
-            if (typeof Tool !== 'undefined' && Tool.selected && Tool.selected.id === 'sms_advanced_vertex_mode' && state.advancedVertex.stage === 'source_edge') {
+            if (typeof Tool !== 'undefined' && Tool.selected && Tool.selected.id === 'sms_advanced_vertex_mode' && state.advancedVertex.stage === 'source_feature') {
                 const selectedCubes = Cube.selected ? Cube.selected.filter(c => c && c.type === 'cube') : [];
                 if (selectedCubes.length) state.advancedVertex.sourceCubeUUID = selectedCubes[selectedCubes.length - 1].uuid;
                 if (!nativeVertexSnapAvailable() || Vertexsnap.step1 !== false) refreshNativeVertexSnapGizmos();
@@ -2058,13 +2276,255 @@
     }
 
     // --------------------------
+    // Detailed blade generator
+    // --------------------------
+
+    function clampNumber(value, min, max) {
+        return Math.max(min, Math.min(max, Number(value)));
+    }
+
+    function analyzeBladeSelection(cubes) {
+        cubes = (cubes || []).filter(cube => cube && cube.type === 'cube');
+        if (cubes.length < 2 || cubes.length % 2 !== 0) {
+            return {error: 'Für die Klinge muss eine gerade Anzahl von mindestens zwei Cubes ausgewählt sein.'};
+        }
+        const parent = cubes[0].parent || 'root';
+        if (cubes.some(cube => (cube.parent || 'root') !== parent)) {
+            return {error: 'Alle ausgewählten Klingen-Cubes müssen in derselben Gruppe liegen.'};
+        }
+
+        const min = [Infinity, Infinity, Infinity];
+        const max = [-Infinity, -Infinity, -Infinity];
+        for (const cube of cubes) {
+            for (let axis = 0; axis < 3; axis++) {
+                min[axis] = Math.min(min[axis], cube.from[axis], cube.to[axis]);
+                max[axis] = Math.max(max[axis], cube.from[axis], cube.to[axis]);
+            }
+        }
+        const spans = min.map((value, axis) => Math.max(0, max[axis] - value));
+        let depthAxis = 0;
+        for (let axis = 1; axis < 3; axis++) {
+            if (spans[axis] < spans[depthAxis]) depthAxis = axis;
+        }
+        const inPlaneAxes = [0, 1, 2].filter(axis => axis !== depthAxis);
+        const center = min.map((value, axis) => (value + max[axis]) / 2);
+        const currentThickness = spans[depthAxis];
+        const referenceThickness = currentThickness > 1e-5 ? currentThickness : 1;
+        return {cubes, parent, min, max, spans, center, depthAxis, inPlaneAxes, currentThickness, referenceThickness};
+    }
+
+    function bladeLayerScale(layerFraction, sharpnessPercent) {
+        const sharpness = clampNumber(sharpnessPercent, 0, 100) / 100;
+        const maximumInset = 0.04 + 0.26 * sharpness;
+        const exponent = 2.8 - 2.0 * sharpness;
+        const inset = maximumInset * Math.pow(clampNumber(layerFraction, 0, 1), exponent);
+        return Math.max(0.2, 1 - inset);
+    }
+
+    function applyBladeLayerTransform(cube, source, analysis, layerCenter, slabThickness, scale) {
+        const depthAxis = analysis.depthAxis;
+        for (let axis = 0; axis < 3; axis++) {
+            if (axis === depthAxis) continue;
+            const pivot = analysis.center[axis];
+            cube.from[axis] = pivot + (source.from[axis] - pivot) * scale;
+            cube.to[axis] = pivot + (source.to[axis] - pivot) * scale;
+            cube.origin[axis] = pivot + (source.origin[axis] - pivot) * scale;
+        }
+
+        const sourceDepthCenter = (source.from[depthAxis] + source.to[depthAxis]) / 2;
+        cube.from[depthAxis] = layerCenter - slabThickness / 2;
+        cube.to[depthAxis] = layerCenter + slabThickness / 2;
+        cube.origin[depthAxis] = source.origin[depthAxis] + (layerCenter - sourceDepthCenter);
+    }
+
+    function createDetailedBlade(analysis, options) {
+        const layersPerSide = Math.round(clampNumber(options.layersPerSide, 1, 16));
+        const finalThickness = clampNumber(options.finalThickness, 0.01, 128);
+        const sharpness = clampNumber(options.sharpness, 0, 100);
+        const totalLayerCount = layersPerSide * 2 + 1;
+        const createdCount = analysis.cubes.length * layersPerSide * 2;
+        if (createdCount > 2400) {
+            quick(`Abgebrochen: ${createdCount} neue Cubes wären zu viel · weniger Layer oder Cubes wählen`, 5200);
+            return false;
+        }
+
+        const slabThickness = finalThickness / totalLayerCount;
+        const sources = analysis.cubes.map(cube => ({
+            cube,
+            from: cube.from.slice(),
+            to: cube.to.slice(),
+            origin: cube.origin.slice(),
+            name: cube.name || 'Cube',
+        }));
+        const created = [];
+        let editOpen = false;
+        const oldMirrorGuard = state.mirrorGuard;
+
+        try {
+            state.mirrorGuard = true;
+            Undo.initEdit({elements: analysis.cubes.slice(), outliner: true});
+            editOpen = true;
+
+            // The existing profile becomes the exact middle layer. Every new layer is
+            // placed at the same distance on both sides, so the result cannot drift.
+            for (const source of sources) {
+                applyBladeLayerTransform(source.cube, source, analysis, analysis.center[analysis.depthAxis], slabThickness, 1);
+                updateCubeGeometryNow(source.cube);
+            }
+
+            for (let layer = 1; layer <= layersPerSide; layer++) {
+                const fraction = layer / layersPerSide;
+                const scale = bladeLayerScale(fraction, sharpness);
+                for (const side of [-1, 1]) {
+                    const layerCenter = analysis.center[analysis.depthAxis] + side * layer * slabThickness;
+                    for (const source of sources) {
+                        const copy = source.cube.duplicate();
+                        if (!copy || copy.type !== 'cube') throw new Error('Cube duplication failed');
+                        copy.name = `${source.name}_Klinge_${side < 0 ? 'L' : 'R'}${layer}`;
+                        try {
+                            const uniqueName = copy.createUniqueName && copy.createUniqueName();
+                            if (uniqueName) copy.name = uniqueName;
+                        } catch (_) {}
+                        applyBladeLayerTransform(copy, source, analysis, layerCenter, slabThickness, scale);
+                        updateCubeGeometryNow(copy);
+                        created.push(copy);
+                    }
+                }
+            }
+
+            const allAffected = analysis.cubes.concat(created);
+            Undo.finishEdit('SMS: Detaillierte Klinge erzeugen', {elements: allAffected, outliner: true});
+            editOpen = false;
+            state.mirrorGuard = oldMirrorGuard;
+
+            selectOnlyCubes(allAffected);
+            try {
+                Canvas.updateView({
+                    elements: allAffected,
+                    element_aspects: {transform: true, geometry: true, uv: true},
+                    selection: true,
+                });
+            } catch (_) {
+                try { Canvas.updateAll(); } catch (_) {}
+            }
+            if (state.smartMirrorEnabled) rebuildMirrorPairs();
+            quick(`${created.length} Klingen-Cubes erzeugt · ${totalLayerCount} Schichten · ${finalThickness.toFixed(3)} Cube-Einheiten dick`, 5600);
+            return true;
+        } catch (e) {
+            warn('Detailed blade generation failed', e);
+            state.mirrorGuard = oldMirrorGuard;
+            if (editOpen) {
+                try { Undo.cancelEdit(true); } catch (_) {}
+            }
+            quick('Die detaillierte Klinge konnte nicht erzeugt werden · Änderung zurückgesetzt', 5200);
+            return false;
+        }
+    }
+
+    function openDetailedBladeDialog() {
+        const selected = Cube && Cube.selected ? Cube.selected.filter(cube => cube && cube.type === 'cube') : [];
+        const analysis = analyzeBladeSelection(selected);
+        if (analysis.error) {
+            quick(analysis.error, 5200);
+            return;
+        }
+
+        const defaultUnits = Math.max(0.25, analysis.currentThickness > 1e-5 ? analysis.currentThickness * 2 : 2);
+        let lastUnits = Math.round(defaultUnits * 1000) / 1000;
+        let lastPercent = Math.round((lastUnits / analysis.referenceThickness) * 1000) / 10;
+        let syncing = false;
+        let dialog = null;
+        dialog = new Dialog({
+            id: 'smart_modeling_detailed_blade',
+            title: 'SMS: Detaillierte Klinge erzeugen',
+            form: {
+                selection_info: {
+                    label: 'Erkannte Ausgangsform',
+                    type: 'info',
+                    text: `${analysis.cubes.length} Cubes · Tiefenachse ${axisName(analysis.depthAxis)} · aktuelle Dicke ${analysis.currentThickness.toFixed(3)}`
+                },
+                final_thickness_units: {
+                    label: 'Enddicke in Cube-Einheiten',
+                    type: 'number',
+                    value: lastUnits,
+                    min: 0.01,
+                    max: 128,
+                    step: 0.05,
+                },
+                final_thickness_percent: {
+                    label: 'Enddicke in % der Ausgangsdicke',
+                    type: 'number',
+                    value: lastPercent,
+                    min: 0.1,
+                    max: 100000,
+                    step: 1,
+                },
+                percent_info: {
+                    label: 'Prozent-Bezug',
+                    type: 'info',
+                    text: analysis.currentThickness > 1e-5
+                        ? `100 % = ${analysis.referenceThickness.toFixed(3)} Cube-Einheiten Ausgangsdicke.`
+                        : 'Das Ausgangsprofil ist 0 dick; deshalb entsprechen hier 100 % genau 1 Cube-Einheit.'
+                },
+                sharpness: {
+                    label: 'Klingenschärfe / äußere Steilheit (%)',
+                    type: 'number',
+                    value: 65,
+                    min: 0,
+                    max: 100,
+                    step: 1,
+                },
+                layers_per_side: {
+                    label: 'Zusätzliche Cube-Layer je Seite',
+                    type: 'number',
+                    value: 4,
+                    min: 1,
+                    max: 16,
+                    step: 1,
+                },
+                layer_info: {
+                    label: 'Layer-Ergebnis',
+                    type: 'info',
+                    text: 'Bei 4 Layern je Seite entstehen 8 neue Layer plus die vorhandene Mittelschicht.'
+                },
+            },
+            onFormChange(result) {
+                if (syncing || !dialog) return;
+                const units = Number(result.final_thickness_units);
+                const percent = Number(result.final_thickness_percent);
+                const unitsChanged = Number.isFinite(units) && Math.abs(units - lastUnits) > 1e-8;
+                const percentChanged = Number.isFinite(percent) && Math.abs(percent - lastPercent) > 1e-8;
+                syncing = true;
+                if (unitsChanged && !percentChanged) {
+                    lastUnits = clampNumber(units, 0.01, 128);
+                    lastPercent = Math.round((lastUnits / analysis.referenceThickness) * 1000) / 10;
+                    dialog.setFormValues({final_thickness_percent: lastPercent}, false);
+                } else if (percentChanged) {
+                    lastPercent = clampNumber(percent, 0.1, 100000);
+                    lastUnits = Math.round((analysis.referenceThickness * lastPercent / 100) * 1000) / 1000;
+                    dialog.setFormValues({final_thickness_units: lastUnits}, false);
+                }
+                syncing = false;
+            },
+            onConfirm(result) {
+                createDetailedBlade(analysis, {
+                    finalThickness: Number(result.final_thickness_units),
+                    sharpness: Number(result.sharpness),
+                    layersPerSide: Number(result.layers_per_side),
+                });
+            }
+        });
+        dialog.show();
+    }
+
+    // --------------------------
     // UI / Actions
     // --------------------------
 
     function openMirrorSettings() {
         new Dialog({
             id: 'smart_modeling_mirror_settings',
-            title: 'Smart Mirror Einstellungen',
+            title: 'SMS: Spiegelmodellierung – Einstellungen',
             form: {
                 axis: {
                     label: 'Spiegelachse',
@@ -2082,7 +2542,7 @@
                 state.mirrorAxis = result.axis === 'Y' ? 1 : result.axis === 'Z' ? 2 : 0;
                 state.mirrorPlane = 8;
                 rebuildMirrorPairs();
-                quick(`Smart Mirror: ${axisName()} = 8`);
+                quick(`SMS-Spiegelachse: ${axisName()} = 8`);
             }
         }).show();
     }
@@ -2138,18 +2598,20 @@
     Plugin.register(PLUGIN_ID, {
         title: 'Smart Modeling Suite',
         author: 'ayfer51',
-        description: 'Continuous Smart Mirror Modeling at coordinate 8, Advanced Vertex edge snapping, exact duplicate detection, lossless texture packing and persistent selection tools.',
+        description: 'Deutsche Modellierwerkzeuge: intelligente Spiegelmodellierung, Eck- und Kantensnapping, detaillierte Klingen, Duplikatprüfung und verlustfreie Texturoptimierung.',
         icon: 'construction',
         version: VERSION,
         variant: 'both',
         min_version: '4.9.0',
+        repository: 'https://github.com/ayfer51/ayfer51-blockbench-modeling',
+        website: 'https://github.com/ayfer51/ayfer51-blockbench-modeling',
 
         onload() {
             log(`Loading v${VERSION}`);
             installCSS();
 
             const smartMirrorToggle = new Toggle('sms_smart_mirror_modeling', {
-                name: 'Smart Mirror Modeling',
+                name: 'SMS: Intelligente Spiegelmodellierung',
                 description: 'Kontinuierlicher Mirror-Modeling-Modus bei Koordinate 8. Neue Cubes, Größenänderungen, Bewegung, Rotation, Löschen und Vertex Snap werden automatisch gespiegelt; die angefasste Seite bleibt dabei unverändert.',
                 icon: 'compare_arrows',
                 value: false,
@@ -2162,26 +2624,26 @@
                         // Existing selected cubes become active Smart-Mirror drivers on
                         // their next edit; all newly created cubes are handled immediately
                         // by the normal Blockbench edit lifecycle.
-                        quick(`Smart Mirror Modeling AN · ${axisName()} = 8`);
+                        quick(`SMS-Spiegelmodellierung AN · ${axisName()} = 8`);
                     } else {
                         restoreNativeMirrorStates();
                         refreshCubeSnapshots();
-                        quick('Smart Mirror Modeling AUS');
+                        quick('SMS-Spiegelmodellierung AUS');
                     }
                 }
             });
             addAction(smartMirrorToggle);
 
             addAction(new Action('sms_mirror_settings', {
-                name: 'Smart Mirror Achse',
+                name: 'SMS: Spiegelachse festlegen',
                 description: 'X, Y oder Z wählen. Die Spiegelebene liegt immer bei Koordinate 8.',
                 icon: 'settings',
                 click: openMirrorSettings
             }), false);
 
             const advancedVertexTool = new Tool('sms_advanced_vertex_mode', {
-                name: 'Advanced Vertex Mode',
-                description: 'Erweitert normales Vertex Snap: Ecke + Ecke nutzt Blockbenchs normales Snap; Quellkante + Zielkante übernimmt deren Länge; Quellkante + zwei Ecken spannt die Kante exakt zwischen diesen Punkten auf.',
+                name: 'SMS: Intelligentes Eck-/Kanten-Snapping',
+                description: 'Ecke auf Ecke verschieben, mit Alt eine Ecke an der Spiegelachse ausrichten oder Kanten direkt beziehungsweise mit Umschalt + zwei benachbarten Ecken wählen.',
                 icon: 'icon-vertexsnap',
                 category: 'tools',
                 modes: ['edit'],
@@ -2198,8 +2660,8 @@
                     if (selected.length) state.advancedVertex.sourceCubeUUID = selected[selected.length - 1].uuid;
                     refreshNativeVertexSnapGizmos();
                     quick(state.advancedVertex.sourceCubeUUID
-                        ? 'Advanced Vertex: Ecke für normales Snap oder Kante für Advanced Snap wählen'
-                        : 'Advanced Vertex: zuerst einen Cube auswählen');
+                        ? 'SMS-Snapping: Ecke oder Kante wählen · Alt = Spiegelachse · Umschalt + 2 Ecken = Kante'
+                        : 'SMS-Snapping: zuerst einen Quell-Cube auswählen', 5200);
                 },
                 onCanvasClick(data) {
                     handleAdvancedVertexClick(data);
@@ -2208,7 +2670,7 @@
                     resetAdvancedVertexOperation(true);
                     state.pendingVertexSnapAuthority = null;
                     resetNativeVertexSnapWorkflow(true);
-                    quick('Advanced Vertex zurückgesetzt - Ecke oder Quellkante wählen');
+                    quick('SMS-Snapping zurückgesetzt · Ecke oder Quellkante wählen');
                     return false;
                 },
                 onUnselect() {
@@ -2220,7 +2682,7 @@
             addAction(advancedVertexTool);
 
             addAction(new Action('sms_check_duplicates', {
-                name: 'Check for Duplicates',
+                name: 'SMS: Exakte Duplikate prüfen',
                 description: 'Findet nur Cubes mit exakt identischem from/to, Pivot und Rotation. Treffer bleiben im frei drehbaren Modell rot markiert.',
                 icon: 'content_copy',
                 condition: () => !!Project && Cube.all && Cube.all.length > 1,
@@ -2228,23 +2690,31 @@
             }));
 
             addAction(new Action('sms_optimize_texture', {
-                name: 'Optimize Texture',
+                name: 'SMS: Textur verlustfrei optimieren',
                 description: 'Packt verwendete UV-Pixel neu, verwendet identische Pixelmuster gemeinsam und übernimmt Box UV automatisch in per-face UV.',
                 icon: 'auto_awesome',
                 condition: () => !!Project && Texture.all && Texture.all.length > 0,
                 click: optimizeSelectedTexture
             }));
 
+            addAction(new Action('sms_create_detailed_blade', {
+                name: 'SMS: Detaillierte Klinge erzeugen',
+                description: 'Erzeugt aus einer geraden, symmetrischen Auswahl flacher Cubes beidseitige, zunehmend verjüngte Tiefen-Layer. Enddicke, Klingenschärfe und Layerzahl sind einstellbar.',
+                icon: 'content_cut',
+                condition: () => !!Project && Cube.selected && Cube.selected.length >= 2,
+                click: openDetailedBladeDialog
+            }));
+
             addAction(new Action('sms_restore_selection', {
-                name: 'Letzte Auswahl wiederherstellen',
+                name: 'SMS: Vorherige Auswahl wiederherstellen',
                 description: 'Stellt die komplette vorherige Mehrfachauswahl wieder her.',
                 icon: 'history',
                 click: restorePreviousSelection
             }));
 
             const stickyToggle = new Toggle('sms_sticky_selection', {
-                name: 'Auswahl festhalten',
-                description: 'Verhindert versehentliches vollständiges Aufheben der Auswahl. Neue bewusste Auswahlen bleiben möglich.',
+                name: 'SMS: Auswahl gegen Leerklick sperren',
+                description: 'Verhindert, dass ein Klick in den leeren 3D-Raum die komplette Auswahl aufhebt. Andere Cubes können weiterhin bewusst ausgewählt werden.',
                 icon: 'push_pin',
                 value: false,
                 onChange(value) {
@@ -2255,18 +2725,18 @@
                             state.currentSelection = now.slice();
                             state.stickySelectionSnapshot = now.slice();
                         }
-                        quick('Auswahl festhalten AN');
+                        quick('SMS-Auswahlsperre AN · Leerklicks heben die Auswahl nicht mehr auf');
                     } else {
                         state.stickySelectionSnapshot = [];
-                        quick('Auswahl festhalten AUS');
+                        quick('SMS-Auswahlsperre AUS');
                     }
                 }
             });
             addAction(stickyToggle);
 
             addAction(new Action('sms_clear_selection', {
-                name: 'Auswahl explizit aufheben',
-                description: 'Hebt die Auswahl auch dann auf, wenn „Auswahl festhalten“ aktiv ist.',
+                name: 'SMS: Auswahl bewusst aufheben',
+                description: 'Hebt die Auswahl auch bei eingeschalteter SMS-Auswahlsperre vollständig auf.',
                 icon: 'deselect',
                 click: explicitClearSelection
             }));
