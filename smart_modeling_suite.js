@@ -1,6 +1,6 @@
 /*
  * Smart Modeling Suite for Blockbench
- * Version 0.6.0
+ * Version 0.7.0
  *
  * Features:
  *  - Smart Mirror Modeling for cubes (X/Y/Z mirror planes)
@@ -16,7 +16,7 @@
 
 (function() {
     const PLUGIN_ID = 'smart_modeling_suite';
-    const VERSION = '0.6.0';
+    const VERSION = '0.7.0';
     const EPS = 1e-7;
 
     let actions = [];
@@ -46,6 +46,8 @@
             targetVertexA: null,
             stage: 'source_feature',
         },
+        lastAdvancedClickToken: null,
+        lastAdvancedClickTime: 0,
 
         duplicateReview: null,
         duplicateReviewNode: null,
@@ -970,8 +972,17 @@
     }
 
     function modifierPressed(data, key) {
-        const event = data && data.event;
-        if (event && event[`${key}Key`]) return true;
+        // Depending on whether this arrives through Tool.onCanvasClick or the global
+        // canvas_click event, Blockbench can expose the PointerEvent directly, inside
+        // `event`, or inside a wrapped original event. Support every shape so Shift
+        // and Alt do not silently disappear on otherwise identical clicks.
+        const candidates = [
+            data,
+            data && data.event,
+            data && data.originalEvent,
+            data && data.event && data.event.originalEvent,
+        ];
+        if (candidates.some(event => event && event[`${key}Key`])) return true;
         try {
             if (typeof Pressing !== 'undefined' && Pressing) {
                 if (Pressing[key]) return true;
@@ -1042,6 +1053,10 @@
     }
 
     function onCanvasClickTrackBuiltInVertexSnap(data) {
+        if (advancedVertexToolIsActive()) {
+            dispatchAdvancedVertexClick(data);
+            return;
+        }
         if (!state.smartMirrorEnabled || !builtInVertexSnapIsActive() || !data || data.type !== 'vertex') return;
         const feature = resolveCubeFeatureHit(data);
         if (!feature || !feature.cube || !state.mirrorSingles.has(feature.cube.uuid)) return;
@@ -1054,6 +1069,23 @@
             side,
             time: Date.now(),
         };
+    }
+
+    function advancedVertexToolIsActive() {
+        try {
+            return typeof Tool !== 'undefined' && Tool.selected && Tool.selected.id === 'sms_advanced_vertex_mode';
+        } catch (_) {
+            return false;
+        }
+    }
+
+    function dispatchAdvancedVertexClick(data) {
+        const now = Date.now();
+        const token = (data && (data.event || data.intersect)) || data;
+        if (token && token === state.lastAdvancedClickToken && now - state.lastAdvancedClickTime < 120) return;
+        state.lastAdvancedClickToken = token || null;
+        state.lastAdvancedClickTime = now;
+        handleAdvancedVertexClick(data);
     }
 
     function primePendingVertexSnapAuthority(data) {
@@ -2385,7 +2417,7 @@
                 index: i,
                 offset: (low + high) / 2,
                 thickness: high - low,
-                fraction: finalThickness > EPS ? Math.abs((low + high) / finalThickness) * 2 : 0,
+                fraction: finalThickness > EPS ? Math.max(Math.abs(low), Math.abs(high)) * 2 / finalThickness : 0,
             });
         }
         return layers;
@@ -2393,11 +2425,12 @@
 
     function bladeLayerScale(layerFraction, sharpnessPercent) {
         const sharpness = clampNumber(sharpnessPercent, 0, 100) / 100;
-        const maximumInset = 0.025 + 0.14 * sharpness;
-        const exponent = 2.4 - 1.25 * sharpness;
+        // Sharpness changes the curvature, not the final silhouette. This keeps
+        // 20/65/90% directly comparable and avoids the exaggerated pyramid effect.
+        const maximumInset = 0.12;
+        const exponent = 0.75 + 2.25 * sharpness;
         const distance = Math.pow(clampNumber(layerFraction, 0, 1), exponent);
-        const smoothDistance = distance * distance * (3 - 2 * distance);
-        const inset = maximumInset * smoothDistance;
+        const inset = maximumInset * distance;
         return Math.max(0.5, 1 - inset);
     }
 
@@ -2437,29 +2470,16 @@
         const depthAxis = analysis.depthAxis;
         const anchor = parseBladeAnchor(analysis, anchorKey);
         const anchorCoordinate = anchor.side === 'max' ? analysis.max[anchor.axis] : analysis.min[anchor.axis];
-        const anchorSpan = Math.max(EPS, analysis.spans[anchor.axis]);
-        const sourceNearCoordinate = anchor.side === 'max'
-            ? Math.max(source.from[anchor.axis], source.to[anchor.axis])
-            : Math.min(source.from[anchor.axis], source.to[anchor.axis]);
-        const sourceDistance = Math.abs(sourceNearCoordinate - anchorCoordinate) / anchorSpan;
-        const attachmentWeight = clampNumber(sourceDistance, 0, 1);
-        const attachmentEase = attachmentWeight * attachmentWeight * (3 - 2 * attachmentWeight);
 
         for (let axis = 0; axis < 3; axis++) {
             if (axis === depthAxis) continue;
-            if (axis === anchor.axis) {
-                cube.from[axis] = anchorCoordinate + (source.from[axis] - anchorCoordinate) * scale;
-                cube.to[axis] = anchorCoordinate + (source.to[axis] - anchorCoordinate) * scale;
-                cube.origin[axis] = anchorCoordinate + (source.origin[axis] - anchorCoordinate) * scale;
-            } else {
-                // Cubes that touch the fixed side retain their full parallel width.
-                // Farther cubes progressively receive the requested layer inset.
-                const parallelScale = 1 - (1 - scale) * attachmentEase;
-                const pivot = analysis.center[axis];
-                cube.from[axis] = pivot + (source.from[axis] - pivot) * parallelScale;
-                cube.to[axis] = pivot + (source.to[axis] - pivot) * parallelScale;
-                cube.origin[axis] = pivot + (source.origin[axis] - pivot) * parallelScale;
-            }
+            // One affine transform for the complete layer preserves every original
+            // adjacency. The selected grip side is the pivot on its axis; the other
+            // in-plane axis stays centered.
+            const pivot = axis === anchor.axis ? anchorCoordinate : analysis.center[axis];
+            cube.from[axis] = pivot + (source.from[axis] - pivot) * scale;
+            cube.to[axis] = pivot + (source.to[axis] - pivot) * scale;
+            cube.origin[axis] = pivot + (source.origin[axis] - pivot) * scale;
         }
 
         const sourceDepthCenter = (source.from[depthAxis] + source.to[depthAxis]) / 2;
@@ -2872,6 +2892,8 @@
                 onSelect() {
                     resetAdvancedVertexOperation(false);
                     resetNativeVertexSnapWorkflow(false);
+                    state.lastAdvancedClickToken = null;
+                    state.lastAdvancedClickTime = 0;
                     const selected = Cube.selected ? Cube.selected.filter(c => c && c.type === 'cube') : [];
                     if (selected.length) state.advancedVertex.sourceCubeUUID = selected[selected.length - 1].uuid;
                     refreshNativeVertexSnapGizmos();
@@ -2880,7 +2902,14 @@
                         : 'SMS-Snapping: zuerst einen Quell-Cube auswählen', 5200);
                 },
                 onCanvasClick(data) {
-                    handleAdvancedVertexClick(data);
+                    dispatchAdvancedVertexClick(data);
+                },
+                onCanvasMouseMove(data) {
+                    try {
+                        if (nativeVertexSnapAvailable() && typeof Vertexsnap.hoverCanvas === 'function') {
+                            Vertexsnap.hoverCanvas(data && data.event ? data.event : data);
+                        }
+                    } catch (_) {}
                 },
                 onCanvasRightClick() {
                     resetAdvancedVertexOperation(true);
