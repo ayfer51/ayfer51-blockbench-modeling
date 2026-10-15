@@ -1,6 +1,6 @@
 /*
  * Smart Modeling Suite for Blockbench
- * Version 0.7.0
+ * Version 0.8.0
  *
  * Features:
  *  - Smart Mirror Modeling for cubes (X/Y/Z mirror planes)
@@ -16,7 +16,7 @@
 
 (function() {
     const PLUGIN_ID = 'smart_modeling_suite';
-    const VERSION = '0.7.0';
+    const VERSION = '0.8.0';
     const EPS = 1e-7;
 
     let actions = [];
@@ -48,6 +48,10 @@
         },
         lastAdvancedClickToken: null,
         lastAdvancedClickTime: 0,
+        lastAdvancedClickX: null,
+        lastAdvancedClickY: null,
+        advancedPointerFallback: null,
+        advancedToolActive: false,
 
         duplicateReview: null,
         duplicateReviewNode: null,
@@ -1048,8 +1052,18 @@
         state.mirrorAuthority.set(cube.uuid, {axis: state.mirrorAxis, side});
     }
 
+    function selectedToolId() {
+        try {
+            // Current Blockbench keeps the active tool in Toolbox.selected. Older
+            // releases also exposed Tool.selected, so retain that as a fallback.
+            if (typeof Toolbox !== 'undefined' && Toolbox && Toolbox.selected) return Toolbox.selected.id || null;
+            if (typeof Tool !== 'undefined' && Tool && Tool.selected) return Tool.selected.id || null;
+        } catch (_) {}
+        return null;
+    }
+
     function builtInVertexSnapIsActive() {
-        try { return typeof Tool !== 'undefined' && Tool.selected && Tool.selected.id === 'vertex_snap_tool'; } catch (_) { return false; }
+        return selectedToolId() === 'vertex_snap_tool';
     }
 
     function onCanvasClickTrackBuiltInVertexSnap(data) {
@@ -1073,19 +1087,94 @@
 
     function advancedVertexToolIsActive() {
         try {
-            return typeof Tool !== 'undefined' && Tool.selected && Tool.selected.id === 'sms_advanced_vertex_mode';
+            if (state.advancedToolActive) return true;
+            return selectedToolId() === 'sms_advanced_vertex_mode';
         } catch (_) {
-            return false;
+            return state.advancedToolActive;
         }
+    }
+
+    function pointerEventFromAdvancedClick(data) {
+        const candidates = [
+            data && data.event,
+            data && data.originalEvent,
+            data && data.event && data.event.originalEvent,
+            data,
+        ];
+        return candidates.find(event => event &&
+            Number.isFinite(event.clientX) && Number.isFinite(event.clientY)) || null;
     }
 
     function dispatchAdvancedVertexClick(data) {
         const now = Date.now();
-        const token = (data && (data.event || data.intersect)) || data;
+        const pointer = pointerEventFromAdvancedClick(data);
+        const token = pointer || (data && data.intersect) || data;
         if (token && token === state.lastAdvancedClickToken && now - state.lastAdvancedClickTime < 120) return;
+        if (pointer && Number.isFinite(state.lastAdvancedClickX) &&
+            Math.abs(pointer.clientX - state.lastAdvancedClickX) < 1 &&
+            Math.abs(pointer.clientY - state.lastAdvancedClickY) < 1 &&
+            now - state.lastAdvancedClickTime < 250) return;
         state.lastAdvancedClickToken = token || null;
         state.lastAdvancedClickTime = now;
+        state.lastAdvancedClickX = pointer ? pointer.clientX : null;
+        state.lastAdvancedClickY = pointer ? pointer.clientY : null;
         handleAdvancedVertexClick(data);
+    }
+
+    function previewForPointerEvent(event) {
+        if (typeof Preview === 'undefined' || !event) return null;
+        const previews = Array.isArray(Preview.all) ? Preview.all : [];
+        const target = event.target;
+        const matched = previews.find(preview => {
+            if (!preview || preview.offscreen) return false;
+            if (preview.canvas === target || preview.node === target) return true;
+            try { return !!(preview.node && preview.node.contains && preview.node.contains(target)); } catch (_) { return false; }
+        });
+        return matched || null;
+    }
+
+    function onAdvancedPointerFallback(event) {
+        if (!advancedVertexToolIsActive() || !event) return;
+        const preview = previewForPointerEvent(event);
+        if (!preview) return;
+
+        if (event.button === 2) {
+            resetAdvancedVertexOperation(true);
+            state.pendingVertexSnapAuthority = null;
+            resetNativeVertexSnapWorkflow(true);
+            quick('SMS-Snapping zurückgesetzt · Ecke oder Quellkante wählen');
+            return;
+        }
+        if (event.button !== 0) return;
+
+        try {
+            // This capture listener is deliberately independent of Tool.onCanvasClick.
+            // Blockbench 5.x can raycast vertices and edges directly from the active
+            // Preview even when a plugin tool receives no canvas callback.
+            const data = preview.raycast(event, {vertices: true, edges: true});
+            if (!data) {
+                quick('SMS-Snap: Klick erkannt, aber keine Ecke oder Kante getroffen', 3200);
+                return;
+            }
+            if (!data.event) data.event = event;
+            log(`Direct snap raycast: ${data.type || 'unknown'}`);
+            dispatchAdvancedVertexClick(data);
+        } catch (e) {
+            warn('Direct preview raycast failed', e);
+            quick('SMS-Snap: Klick erkannt, Raycast fehlgeschlagen · Console prüfen', 4200);
+        }
+    }
+
+    function installAdvancedPointerFallback() {
+        if (state.advancedPointerFallback || typeof document === 'undefined') return;
+        state.advancedPointerFallback = onAdvancedPointerFallback;
+        document.addEventListener('pointerdown', state.advancedPointerFallback, true);
+    }
+
+    function removeAdvancedPointerFallback() {
+        if (!state.advancedPointerFallback || typeof document === 'undefined') return;
+        try { document.removeEventListener('pointerdown', state.advancedPointerFallback, true); } catch (_) {}
+        state.advancedPointerFallback = null;
     }
 
     function primePendingVertexSnapAuthority(data) {
@@ -1828,7 +1917,7 @@
         // While waiting for a new source edge, an explicit selection in the outliner or
         // viewport should immediately become the Advanced Vertex source cube.
         try {
-            if (typeof Tool !== 'undefined' && Tool.selected && Tool.selected.id === 'sms_advanced_vertex_mode' && state.advancedVertex.stage === 'source_feature') {
+            if (advancedVertexToolIsActive() && state.advancedVertex.stage === 'source_feature') {
                 const selectedCubes = Cube.selected ? Cube.selected.filter(c => c && c.type === 'cube') : [];
                 if (selectedCubes.length) state.advancedVertex.sourceCubeUUID = selectedCubes[selectedCubes.length - 1].uuid;
                 if (!nativeVertexSnapAvailable() || Vertexsnap.step1 !== false) refreshNativeVertexSnapGizmos();
@@ -2425,13 +2514,14 @@
 
     function bladeLayerScale(layerFraction, sharpnessPercent) {
         const sharpness = clampNumber(sharpnessPercent, 0, 100) / 100;
-        // Sharpness changes the curvature, not the final silhouette. This keeps
-        // 20/65/90% directly comparable and avoids the exaggerated pyramid effect.
-        const maximumInset = 0.12;
-        const exponent = 0.75 + 2.25 * sharpness;
+        // Sharpness now controls both the amount and timing of the bevel. The range
+        // stays deliberately bounded: 20% is only lightly narrowed, 65% is clearly
+        // beveled and 90% is strong without collapsing the profile into a spike.
+        const maximumInset = 0.02 + 0.28 * Math.pow(sharpness, 1.35);
+        const exponent = 0.65 + 3.1 * Math.pow(sharpness, 1.15);
         const distance = Math.pow(clampNumber(layerFraction, 0, 1), exponent);
         const inset = maximumInset * distance;
-        return Math.max(0.5, 1 - inset);
+        return Math.max(0.68, 1 - inset);
     }
 
     function bladeAnchorOptions(analysis) {
@@ -2623,7 +2713,10 @@
             editOpen = false;
             state.mirrorGuard = oldMirrorGuard;
 
-            selectOnlyCubes(allAffected);
+            // Selecting every generated layer draws all outlines through the solid
+            // model and makes different bevel curves look almost identical. Keep only
+            // the original middle profile selected so the final silhouette is readable.
+            selectOnlyCubes(analysis.cubes);
             try {
                 Canvas.updateView({
                     elements: allAffected,
@@ -2634,7 +2727,7 @@
                 try { Canvas.updateAll(); } catch (_) {}
             }
             if (state.smartMirrorEnabled) rebuildMirrorPairs();
-            quick(`${created.length} Klingen-Cubes erzeugt · ${totalLayerCount} Schichten · ${finalThickness.toFixed(3)} Cube-Einheiten dick`, 5600);
+            quick(`${created.length} Klingen-Cubes erzeugt · ${totalLayerCount} Schichten · Mittelschicht ausgewählt`, 5600);
             return true;
         } catch (e) {
             warn('Detailed blade generation failed', e);
@@ -2699,7 +2792,7 @@
                     options: bladeAnchorOptions(analysis),
                 },
                 sharpness: {
-                    label: 'Klingenschärfe / äußere Steilheit (%)',
+                    label: 'Klingenschärfe (20 stumpf · 90 scharf)',
                     type: 'number',
                     value: 65,
                     min: 0,
@@ -2717,7 +2810,7 @@
                 layer_info: {
                     label: 'Layer-Ergebnis',
                     type: 'info',
-                    text: 'Die Layer bleiben lückenlos, erhalten aber je nach Schärfe unterschiedliche Tiefenabstände und Dicken.'
+                    text: 'Schärfe verändert sichtbar die Verjüngung und deren Verlauf. Alle Layer bleiben dabei lückenlos und symmetrisch.'
                 },
             },
             onFormChange(result) {
@@ -2845,6 +2938,7 @@
         onload() {
             log(`Loading v${VERSION}`);
             installCSS();
+            installAdvancedPointerFallback();
 
             const smartMirrorToggle = new Toggle('sms_smart_mirror_modeling', {
                 name: 'SMS: Smart Mirror Modeling',
@@ -2890,16 +2984,19 @@
                 raycast_options: {edges: true, vertices: true},
                 condition: () => !!Project && typeof Cube !== 'undefined' && Cube.all && Cube.all.length > 0,
                 onSelect() {
+                    state.advancedToolActive = true;
                     resetAdvancedVertexOperation(false);
                     resetNativeVertexSnapWorkflow(false);
                     state.lastAdvancedClickToken = null;
                     state.lastAdvancedClickTime = 0;
+                    state.lastAdvancedClickX = null;
+                    state.lastAdvancedClickY = null;
                     const selected = Cube.selected ? Cube.selected.filter(c => c && c.type === 'cube') : [];
                     if (selected.length) state.advancedVertex.sourceCubeUUID = selected[selected.length - 1].uuid;
                     refreshNativeVertexSnapGizmos();
                     quick(state.advancedVertex.sourceCubeUUID
-                        ? 'SMS-Snapping: Ecke oder Kante wählen · Alt = Spiegelachse · Umschalt + 2 Ecken = Kante'
-                        : 'SMS-Snapping: zuerst einen Quell-Cube auswählen', 5200);
+                        ? `SMS-Snapping v${VERSION} aktiv · Ecke/Kante wählen · Alt = Spiegelachse · Umschalt + 2 Ecken = Kante`
+                        : `SMS-Snapping v${VERSION} aktiv · zuerst einen Quell-Cube auswählen`, 5200);
                 },
                 onCanvasClick(data) {
                     dispatchAdvancedVertexClick(data);
@@ -2919,6 +3016,7 @@
                     return false;
                 },
                 onUnselect() {
+                    state.advancedToolActive = false;
                     resetAdvancedVertexOperation(false);
                     state.pendingVertexSnapAuthority = null;
                     resetNativeVertexSnapWorkflow(false);
@@ -2985,6 +3083,8 @@
 
         onunload() {
             state.smartMirrorEnabled = false;
+            state.advancedToolActive = false;
+            removeAdvancedPointerFallback();
             restoreNativeMirrorStates();
             if (state.syncTimer !== null) {
                 clearTimeout(state.syncTimer);
