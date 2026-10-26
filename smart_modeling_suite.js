@@ -1,6 +1,6 @@
 /*
  * Smart Modeling Suite for Blockbench
- * Version 0.9.1
+ * Version 0.9.2
  *
  * Features:
  *  - Smart Mirror Modeling for cubes (X/Y/Z mirror planes)
@@ -16,7 +16,7 @@
 
 (function() {
     const PLUGIN_ID = 'smart_modeling_suite';
-    const VERSION = '0.9.1';
+    const VERSION = '0.9.2';
     const EPS = 1e-7;
 
     let actions = [];
@@ -61,6 +61,15 @@
         selectionGuard: false,
         currentSelection: [],
         previousSelection: [],
+
+        // Strict Smart Mirror selection invariant. While SMM performs any internal
+        // work, only the elements that were already selected by the user at the
+        // beginning of that edit may be selected. Generated mirror partners are
+        // blocked at the selection API and removed from Project.selected_elements.
+        smmSelectionLock: null,
+        smmEditSelectionSnapshot: null,
+        smmFallbackSelectionSnapshot: null,
+        originalCubeSelectLow: null,
     };
 
     function log(...args) {
@@ -538,23 +547,34 @@
             }
         } catch (_) {}
 
-        // Defensive hard stop: even if a host-version hook selected the new cube
-        // during init(), remove only this newly generated mirror from the selection.
+        // Defensive hard stop: a generated mirror is NEVER allowed to enter the
+        // selection. Do not use the public unselect path only; remove it directly
+        // from Blockbench's selection array as well so there is no intermediate
+        // selected state left behind by host-version hooks.
         try {
-            const selected = (typeof Outliner !== 'undefined' && Outliner.selected) ? Outliner.selected : [];
-            if (copy.selected || (selected && selected.includes(copy))) {
-                if (typeof copy.unselect === 'function') copy.unselect();
+            copy.selected = false;
+            if (typeof Project !== 'undefined' && Project && Array.isArray(Project.selected_elements)) {
+                for (let i = Project.selected_elements.length - 1; i >= 0; i--) {
+                    if (Project.selected_elements[i] === copy) Project.selected_elements.splice(i, 1);
+                }
             }
+            enforceSmartMirrorSelectionLock();
         } catch (_) {}
 
         return copy;
     }
 
-    function synchronizeSmartMirrorInline(data, forcedUUIDs = []) {
+    function synchronizeSmartMirrorInline(data, forcedUUIDs = [], selectionSnapshot = null) {
         if (!state.smartMirrorEnabled || state.mirrorGuard || !Project || !Cube || !Cube.all) return;
-        state.mirrorGuard = true;
 
-        const selectionBefore = currentSelectionUUIDs ? currentSelectionUUIDs() : [];
+        // The snapshot must come from BEFORE SMM starts touching the edit. This is
+        // deliberately not taken after mirror hooks have begun because by then a
+        // Blockbench callback could already have changed the selection.
+        const selectionBefore = Array.isArray(selectionSnapshot)
+            ? selectionSnapshot.slice()
+            : currentSelectionUUIDs();
+        beginSmartMirrorSelectionLock(selectionBefore);
+        state.mirrorGuard = true;
         const currentByUUID = new Map(Cube.all.map(c => [c.uuid, c]));
         const currentUUIDs = new Set(currentByUUID.keys());
         const dirtyElements = new Set();
@@ -613,6 +633,7 @@
             const candidateIndex = buildMirrorCandidateIndex(Array.from(currentByUUID.values()));
 
             for (const cube of drivers) {
+                enforceSmartMirrorSelectionLock();
                 if (!cube || !currentByUUID.has(cube.uuid)) continue;
                 dirtyElements.add(cube);
                 const previous = state.cubeSnapshots.get(cube.uuid);
@@ -651,8 +672,18 @@
                     try {
                         if (data && data.aspects) data.aspects.outliner = true;
                         partner = duplicateCubeWithoutSelecting(cube);
+                        enforceSmartMirrorSelectionLock();
                         if (partner) {
+                            // Absolute invariant: the generated counterpart is never
+                            // selectable as a side effect of SMM.
+                            partner.selected = false;
+                            if (Project && Array.isArray(Project.selected_elements)) {
+                                for (let i = Project.selected_elements.length - 1; i >= 0; i--) {
+                                    if (Project.selected_elements[i] === partner) Project.selected_elements.splice(i, 1);
+                                }
+                            }
                             applyMirroredTransform(cube, partner);
+                            enforceSmartMirrorSelectionLock();
                             pairCubes(cube, partner);
                             pushAspectElement(data, partner);
                             dirtyElements.add(partner);
@@ -665,9 +696,11 @@
                 } else {
                     pushAspectElement(data, partner);
                     applyMirroredTransform(cube, partner);
+                    enforceSmartMirrorSelectionLock();
                     pairCubes(cube, partner);
                     dirtyElements.add(partner);
                 }
+                enforceSmartMirrorSelectionLock();
                 state.mirrorAuthority.delete(cube.uuid);
             }
 
@@ -681,23 +714,27 @@
                 try { Canvas.updateAll(); } catch (_) {}
             }
 
-            // SMM is selection-neutral. Restore the exact pre-mirror selection if
-            // anything changed, including the important empty-selection case. An
-            // automatically generated mirror cube is therefore never left selected.
+            // Keep enforcing the invariant before any selection redraw. The user's
+            // exact starting selection (minus elements they actually deleted) wins.
+            enforceSmartMirrorSelectionLock();
             const survivingSelection = selectionBefore.filter(uuid => findOutlinerElementByUUID(uuid));
-            const selectionAfter = currentSelectionUUIDs();
-            if (!sameUUIDSelection(selectionAfter, survivingSelection)) {
-                selectOnlyElements(survivingSelection.map(findOutlinerElementByUUID).filter(Boolean));
-                state.currentSelection = currentSelectionUUIDs();
-            }
+            forceSelectionUUIDsDirect(survivingSelection);
+            state.currentSelection = currentSelectionUUIDs();
         } finally {
+            // One last direct clamp happens while the lock is still active. Only then
+            // is SMM allowed to release control of selection again.
+            enforceSmartMirrorSelectionLock();
             refreshCubeSnapshots();
             state.mirrorGuard = false;
+            endSmartMirrorSelectionLock();
         }
     }
 
     function onInitEditSmartMirror(data) {
         if (!state.smartMirrorEnabled || state.mirrorGuard || !data || !data.aspects) return;
+        // Capture the user's selection at the earliest edit lifecycle event. SMM is
+        // not allowed to expand beyond this set at any later point in this edit.
+        state.smmEditSelectionSnapshot = currentSelectionUUIDs();
         const elements = Array.isArray(data.aspects.elements) ? data.aspects.elements.slice() : [];
         let touchesCube = false;
         for (const el of elements) {
@@ -719,10 +756,15 @@
             // we mirror the opposite side around coordinate 8. The clicked side itself
             // therefore never gets pulled back by Smart Mirror.
             primePendingVertexSnapAuthority(data);
-            synchronizeSmartMirrorInline(data || {aspects: {elements: [], outliner: true}});
+            const snapshot = Array.isArray(state.smmEditSelectionSnapshot)
+                ? state.smmEditSelectionSnapshot.slice()
+                : currentSelectionUUIDs();
+            synchronizeSmartMirrorInline(data || {aspects: {elements: [], outliner: true}}, [], snapshot);
         } catch (e) {
             warn('Automatic Smart Mirror failed', e);
             refreshCubeSnapshots();
+        } finally {
+            state.smmEditSelectionSnapshot = null;
         }
     }
 
@@ -734,13 +776,18 @@
             state.syncTimer = null;
             if (!state.smartMirrorEnabled || state.mirrorGuard || !state.forcedMirrorUUIDs.size) return;
             const pending = Array.from(state.forcedMirrorUUIDs).map(getCubeByUUID).filter(Boolean);
-            if (pending.length) processSmartMirrorCubes(pending, {silent: true});
+            const snapshot = Array.isArray(state.smmFallbackSelectionSnapshot)
+                ? state.smmFallbackSelectionSnapshot.slice()
+                : currentSelectionUUIDs();
+            state.smmFallbackSelectionSnapshot = null;
+            if (pending.length) processSmartMirrorCubes(pending, {silent: true, selectionSnapshot: snapshot});
             else state.forcedMirrorUUIDs.clear();
         }, 0);
     }
 
     function onAddCubeSmartMirror(data) {
         if (!state.smartMirrorEnabled || state.mirrorGuard || !data || !data.object) return;
+        if (!state.smmFallbackSelectionSnapshot) state.smmFallbackSelectionSnapshot = currentSelectionUUIDs();
         state.forcedMirrorUUIDs.add(data.object.uuid);
         // Normal edits are handled by finish_edit and clear this queue first. The
         // deferred fallback covers imports/scripts that emit add_cube without a normal
@@ -763,10 +810,13 @@
             return;
         }
         const uuids = cubes.map(c => c.uuid);
+        const selectionSnapshot = Array.isArray(options.selectionSnapshot)
+            ? options.selectionSnapshot.slice()
+            : currentSelectionUUIDs();
         try {
             Undo.initEdit({elements: cubes.slice(), outliner: true});
             const fake = {aspects: {elements: cubes.slice(), outliner: true}, message: 'SMS: Apply Mirror'};
-            synchronizeSmartMirrorInline(fake, uuids);
+            synchronizeSmartMirrorInline(fake, uuids, selectionSnapshot);
             Undo.finishEdit('SMS: Apply Mirror', fake.aspects);
             if (!options.silent) quick(`${cubes.length} Cube(s) mit Smart Mirror synchronisiert`);
         } catch (e) {
@@ -2066,6 +2116,63 @@
         return Outliner.selected.filter(el => el && el.uuid).map(el => el.uuid);
     }
 
+    function normalizeSelectionUUIDs(uuids) {
+        const seen = new Set();
+        return (uuids || []).filter(uuid => {
+            if (!uuid || seen.has(uuid)) return false;
+            seen.add(uuid);
+            return true;
+        });
+    }
+
+    function forceSelectionUUIDsDirect(uuids) {
+        if (!Project || !Array.isArray(Project.selected_elements)) return;
+        const normalized = normalizeSelectionUUIDs(uuids);
+        const wanted = normalized.map(findOutlinerElementByUUID).filter(Boolean);
+        const wantedSet = new Set(wanted.map(el => el.uuid));
+
+        // Replace the backing array directly. This avoids select()/selectLow(), so no
+        // SMM-generated object can be introduced by selection side effects.
+        Project.selected_elements.splice(0, Project.selected_elements.length, ...wanted);
+
+        try {
+            for (const el of (Outliner.elements || [])) {
+                if (!el || !el.uuid) continue;
+                const shouldBeSelected = wantedSet.has(el.uuid);
+                if (el.selected !== shouldBeSelected) el.selected = shouldBeSelected;
+            }
+        } catch (_) {}
+        try { if (typeof TickUpdates !== 'undefined') TickUpdates.selection = true; } catch (_) {}
+    }
+
+    function beginSmartMirrorSelectionLock(uuids) {
+        const normalized = normalizeSelectionUUIDs(uuids);
+        state.smmSelectionLock = new Set(normalized);
+        forceSelectionUUIDsDirect(normalized);
+    }
+
+    function enforceSmartMirrorSelectionLock() {
+        if (!state.smmSelectionLock) return;
+        const allowed = [];
+        for (const uuid of state.smmSelectionLock) {
+            if (findOutlinerElementByUUID(uuid)) allowed.push(uuid);
+        }
+        // If an originally selected element was deleted by the user, selection may
+        // shrink. It may NEVER grow beyond the user's original set.
+        forceSelectionUUIDsDirect(allowed);
+    }
+
+    function endSmartMirrorSelectionLock() {
+        if (!state.smmSelectionLock) return;
+        enforceSmartMirrorSelectionLock();
+        state.smmSelectionLock = null;
+        try {
+            if (typeof updateSelection === 'function') updateSelection();
+            else Blockbench.dispatchEvent('update_selection', {});
+        } catch (_) {}
+        try { Canvas.updateView({elements: Outliner.selected.slice(), selection: true}); } catch (_) {}
+    }
+
     function sameUUIDSelection(a, b) {
         if (a.length !== b.length) return false;
         const set = new Set(a);
@@ -2111,6 +2218,10 @@
     }
 
     function onSelectionUpdate() {
+        if (state.smmSelectionLock) {
+            enforceSmartMirrorSelectionLock();
+            return;
+        }
         if (state.selectionGuard) return;
         const now = currentSelectionUUIDs();
 
@@ -3148,6 +3259,30 @@
         onload() {
             log(`Loading v${VERSION}`);
             installCSS();
+
+            // Last line of defence for Blockbench 4.x/5.x host callbacks: while SMM
+            // owns the selection, a generated counterpart cannot be selected even if
+            // some internal code calls Cube.selectLow(). Manual user selection is
+            // unaffected because the gate only exists during an active SMM sync.
+            try {
+                if (typeof Cube !== 'undefined' && Cube.prototype && typeof Cube.prototype.selectLow === 'function') {
+                    state.originalCubeSelectLow = Cube.prototype.selectLow;
+                    Cube.prototype.selectLow = function(...args) {
+                        if (state.smmSelectionLock && !state.smmSelectionLock.has(this.uuid)) {
+                            this.selected = false;
+                            if (Project && Array.isArray(Project.selected_elements)) {
+                                for (let i = Project.selected_elements.length - 1; i >= 0; i--) {
+                                    if (Project.selected_elements[i] === this) Project.selected_elements.splice(i, 1);
+                                }
+                            }
+                            return this;
+                        }
+                        return state.originalCubeSelectLow.apply(this, args);
+                    };
+                }
+            } catch (e) {
+                warn('Could not install strict SMM selection gate', e);
+            }
             installAdvancedPointerFallback();
 
             const smartMirrorToggle = new Toggle('sms_smart_mirror_modeling', {
@@ -3295,6 +3430,15 @@
         onunload() {
             state.smartMirrorEnabled = false;
             state.advancedToolActive = false;
+            state.smmSelectionLock = null;
+            state.smmEditSelectionSnapshot = null;
+            state.smmFallbackSelectionSnapshot = null;
+            try {
+                if (state.originalCubeSelectLow && typeof Cube !== 'undefined' && Cube.prototype) {
+                    Cube.prototype.selectLow = state.originalCubeSelectLow;
+                }
+            } catch (_) {}
+            state.originalCubeSelectLow = null;
             removeAdvancedPointerFallback();
             restoreNativeMirrorStates();
             if (state.syncTimer !== null) {
