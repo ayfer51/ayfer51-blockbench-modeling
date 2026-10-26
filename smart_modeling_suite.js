@@ -1,6 +1,6 @@
 /*
  * Smart Modeling Suite for Blockbench
- * Version 0.8.0
+ * Version 0.9.1
  *
  * Features:
  *  - Smart Mirror Modeling for cubes (X/Y/Z mirror planes)
@@ -16,7 +16,7 @@
 
 (function() {
     const PLUGIN_ID = 'smart_modeling_suite';
-    const VERSION = '0.8.0';
+    const VERSION = '0.9.1';
     const EPS = 1e-7;
 
     let actions = [];
@@ -44,6 +44,7 @@
             sourceEdge: null,
             sourceEdgeVertexA: null,
             targetVertexA: null,
+            nativeVertexSourcePrimed: false,
             stage: 'source_feature',
         },
         lastAdvancedClickToken: null,
@@ -485,6 +486,70 @@
         return db > da ? b : a;
     }
 
+    // Smart Mirror must never select the automatically generated counterpart.
+    // Blockbench's native OutlinerElement.duplicate() intentionally replaces the
+    // source element in the current selection with its copy. For SMM that is the
+    // exact opposite of the desired behaviour, so mirror partners are cloned via
+    // the same low-level steps without ever touching Project.selected_elements.
+    function duplicateCubeWithoutSelecting(source) {
+        if (!source || source.type !== 'cube') return null;
+
+        const CopyType = source.constructor || Cube;
+        const copy = new CopyType(source);
+
+        // Keep Blockbench's normal duplicate naming behaviour.
+        try {
+            const numberMatch = copy.name && copy.name.match(/[0-9]+$/);
+            if (numberMatch) {
+                const number = parseInt(numberMatch[0], 10);
+                copy.name = copy.name.replace(/[0-9]+$/, String(number + 1));
+            }
+        } catch (_) {}
+
+        // Insert the clone next to the source/last selected sibling, matching the
+        // native duplicate placement while deliberately skipping all selection code.
+        try {
+            if (typeof source.getParentArray === 'function' && typeof copy.sortInBefore === 'function') {
+                const siblings = source.getParentArray();
+                const anchors = Array.isArray(siblings)
+                    ? siblings.filter(el => el && (el.selected || el === source))
+                    : [];
+                const anchor = anchors.length ? anchors[anchors.length - 1] : source;
+                copy.sortInBefore(anchor, 1);
+            } else if (typeof copy.addTo === 'function') {
+                copy.addTo(source.parent || 'root');
+            }
+            if (typeof copy.init === 'function') copy.init();
+        } catch (e) {
+            warn('Could not initialize unselected smart mirror cube', e);
+            try { if (copy && typeof copy.remove === 'function') copy.remove(); } catch (_) {}
+            return null;
+        }
+
+        // Match Blockbench's duplicate housekeeping without selecting the clone.
+        try {
+            if (typeof Property !== 'undefined' && typeof Property.resetUniqueValues === 'function') {
+                Property.resetUniqueValues(CopyType, copy);
+            }
+        } catch (_) {}
+        try {
+            if (typeof Condition !== 'undefined' && Condition(copy.needsUniqueName) && typeof copy.createUniqueName === 'function') {
+                copy.createUniqueName();
+            }
+        } catch (_) {}
+
+        // Defensive hard stop: even if a host-version hook selected the new cube
+        // during init(), remove only this newly generated mirror from the selection.
+        try {
+            const selected = (typeof Outliner !== 'undefined' && Outliner.selected) ? Outliner.selected : [];
+            if (copy.selected || (selected && selected.includes(copy))) {
+                if (typeof copy.unselect === 'function') copy.unselect();
+            }
+        } catch (_) {}
+
+        return copy;
+    }
+
     function synchronizeSmartMirrorInline(data, forcedUUIDs = []) {
         if (!state.smartMirrorEnabled || state.mirrorGuard || !Project || !Cube || !Cube.all) return;
         state.mirrorGuard = true;
@@ -585,7 +650,7 @@
                 if (!partner) {
                     try {
                         if (data && data.aspects) data.aspects.outliner = true;
-                        partner = cube.duplicate();
+                        partner = duplicateCubeWithoutSelecting(cube);
                         if (partner) {
                             applyMirroredTransform(cube, partner);
                             pairCubes(cube, partner);
@@ -616,9 +681,15 @@
                 try { Canvas.updateAll(); } catch (_) {}
             }
 
-            // Duplicating a cube can change Blockbench's selection. Put the user's
-            // selection back exactly as it was, including multi-selection.
-            if (selectionBefore.length) restoreSelectionByUUIDs(selectionBefore.filter(uuid => getCubeByUUID(uuid)), false);
+            // SMM is selection-neutral. Restore the exact pre-mirror selection if
+            // anything changed, including the important empty-selection case. An
+            // automatically generated mirror cube is therefore never left selected.
+            const survivingSelection = selectionBefore.filter(uuid => findOutlinerElementByUUID(uuid));
+            const selectionAfter = currentSelectionUUIDs();
+            if (!sameUUIDSelection(selectionAfter, survivingSelection)) {
+                selectOnlyElements(survivingSelection.map(findOutlinerElementByUUID).filter(Boolean));
+                state.currentSelection = currentSelectionUUIDs();
+            }
         } finally {
             refreshCubeSnapshots();
             state.mirrorGuard = false;
@@ -935,6 +1006,77 @@
         return bestCube;
     }
 
+    function projectWorldPointToCanvas(data, worldPoint) {
+        const event = pointerEventFromAdvancedClick(data);
+        if (!event || !worldPoint || typeof worldPoint.clone !== 'function') return null;
+        const preview = previewForPointerEvent(event);
+        if (!preview || !preview.camera) return null;
+        const surface = preview.canvas || preview.node;
+        if (!surface || typeof surface.getBoundingClientRect !== 'function') return null;
+        try {
+            const rect = surface.getBoundingClientRect();
+            if (!rect || rect.width <= 0 || rect.height <= 0) return null;
+            const projected = worldPoint.clone().project(preview.camera);
+            if (![projected.x, projected.y, projected.z].every(Number.isFinite)) return null;
+            return {
+                x: rect.left + (projected.x + 1) * rect.width / 2,
+                y: rect.top + (1 - projected.y) * rect.height / 2,
+                z: projected.z,
+            };
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function pointToScreenSegmentDistance(point, a, b) {
+        const dx = b.x - a.x;
+        const dy = b.y - a.y;
+        const lengthSquared = dx * dx + dy * dy;
+        if (lengthSquared <= EPS) return Math.hypot(point.x - a.x, point.y - a.y);
+        const t = Math.max(0, Math.min(1, ((point.x - a.x) * dx + (point.y - a.y) * dy) / lengthSquared));
+        return Math.hypot(point.x - (a.x + dx * t), point.y - (a.y + dy * t));
+    }
+
+    function resolveProjectedCubeFeature(data, cube, geometry) {
+        const event = pointerEventFromAdvancedClick(data);
+        if (!event || !cube || !geometry) return null;
+        const pointer = {x: event.clientX, y: event.clientY};
+
+        let nearestVertex = null;
+        let vertexDistance = Infinity;
+        for (const vertex of geometry.vertices) {
+            const screen = projectWorldPointToCanvas(data, vertex.world);
+            if (!screen || screen.z < -1.1 || screen.z > 1.1) continue;
+            const distance = Math.hypot(pointer.x - screen.x, pointer.y - screen.y);
+            if (distance < vertexDistance) {
+                vertexDistance = distance;
+                nearestVertex = vertex;
+            }
+        }
+        // A slightly generous screen-space radius makes corners on unselected target
+        // cubes clickable without turning clicks in the middle of a face into snaps.
+        if (nearestVertex && vertexDistance <= 24) {
+            return {type: 'vertex', cube, vertex: nearestVertex, geometry, projected: true};
+        }
+
+        let nearestEdge = null;
+        let edgeDistance = Infinity;
+        for (const edge of geometry.edges) {
+            const a = projectWorldPointToCanvas(data, edge.a.world);
+            const b = projectWorldPointToCanvas(data, edge.b.world);
+            if (!a || !b) continue;
+            const distance = pointToScreenSegmentDistance(pointer, a, b);
+            if (distance < edgeDistance) {
+                edgeDistance = distance;
+                nearestEdge = edge;
+            }
+        }
+        if (nearestEdge && edgeDistance <= 11) {
+            return {type: 'edge', cube, edge: nearestEdge, geometry, projected: true};
+        }
+        return null;
+    }
+
     function resolveCubeFeatureHit(data) {
         let cube = raycastCubeFromData(data);
         const sourceCube = getCubeByUUID(state.advancedVertex.sourceCubeUUID);
@@ -971,6 +1113,14 @@
             });
             if (!edge) return null;
             return {type: 'edge', cube, edge, geometry};
+        }
+        // Blockbench only returns native vertex/edge hits for elements which already
+        // own gizmos. During the second snap step, the target cube is deliberately not
+        // selected. Promote an ordinary element/face hit near its projected corner or
+        // outline to a feature hit so the workflow remains usable even if a host build
+        // does not expose the native target gizmos to this plugin tool.
+        if (data.type === 'element' || data.type === 'cube' || data.type === 'face') {
+            return resolveProjectedCubeFeature(data, cube, geometry);
         }
         return null;
     }
@@ -1153,6 +1303,11 @@
             // Preview even when a plugin tool receives no canvas callback.
             const data = preview.raycast(event, {vertices: true, edges: true});
             if (!data) {
+                if (state.advancedVertex.stage === 'target_vertex' &&
+                    state.advancedVertex.sourceVertex && modifierPressed({event}, 'alt')) {
+                    dispatchAdvancedVertexClick({type: 'none', event});
+                    return;
+                }
                 quick('SMS-Snap: Klick erkannt, aber keine Ecke oder Kante getroffen', 3200);
                 return;
             }
@@ -1200,6 +1355,7 @@
     }
 
     function resetNativeVertexSnapWorkflow(reselect = false) {
+        state.advancedVertex.nativeVertexSourcePrimed = false;
         if (!nativeVertexSnapAvailable()) return;
         try {
             Vertexsnap.step1 = true;
@@ -1207,6 +1363,47 @@
             if (reselect) Vertexsnap.select();
         } catch (e) {
             warn('Could not reset native Vertex Snap workflow', e);
+        }
+    }
+
+    function showNativeTargetVertexGizmos(sourceCube) {
+        if (typeof Vertexsnap === 'undefined' || !Vertexsnap || typeof Vertexsnap.addVertices !== 'function') return false;
+        let added = 0;
+        try {
+            if (typeof Vertexsnap.clearVertexGizmos === 'function') Vertexsnap.clearVertexGizmos();
+            const cubes = typeof Cube !== 'undefined' && Cube.all ? Cube.all : [];
+            for (const cube of cubes) {
+                if (!cube || cube === sourceCube || cube.visibility === false) continue;
+                Vertexsnap.addVertices(cube);
+                added++;
+            }
+            return added > 0;
+        } catch (e) {
+            warn('Could not show target vertex gizmos', e);
+            return false;
+        }
+    }
+
+    function beginNativeTargetVertexMode(data, sourceCube) {
+        if (!nativeVertexSnapAvailable()) return showNativeTargetVertexGizmos(sourceCube);
+        try {
+            // Delegating only the first click reproduces Blockbench's normal two-step
+            // UX: it hides the source handles and exposes the vertices of all possible
+            // target elements. SMS still performs the actual translation itself.
+            if (Vertexsnap.step1 === false) resetNativeVertexSnapWorkflow(false);
+            Vertexsnap.canvasClick(data);
+            state.advancedVertex.nativeVertexSourcePrimed = Vertexsnap.step1 === false;
+            const nativeTargets = Array.isArray(Vertexsnap.elements_with_vertex_gizmos)
+                ? Vertexsnap.elements_with_vertex_gizmos.filter(element => element && element !== sourceCube)
+                : [];
+            // Some 5.x builds switch to step two but do not populate target handles
+            // for a plugin-owned Tool. Fill them explicitly in that case.
+            const targetsVisible = nativeTargets.length > 0 || showNativeTargetVertexGizmos(sourceCube);
+            return state.advancedVertex.nativeVertexSourcePrimed || targetsVisible;
+        } catch (e) {
+            warn('Could not enter native target vertex mode', e);
+            state.advancedVertex.nativeVertexSourcePrimed = false;
+            return showNativeTargetVertexGizmos(sourceCube);
         }
     }
 
@@ -1271,6 +1468,7 @@
         state.advancedVertex.sourceEdge = null;
         state.advancedVertex.sourceEdgeVertexA = null;
         state.advancedVertex.targetVertexA = null;
+        state.advancedVertex.nativeVertexSourcePrimed = false;
         state.advancedVertex.stage = 'source_feature';
     }
 
@@ -1492,14 +1690,29 @@
     }
 
     function handleAdvancedVertexClick(data) {
-        const hit = resolveCubeFeatureHit(data);
-        if (!hit) {
-            quick('Keine Ecke oder Kante erkannt · näher an einen Griffpunkt klicken');
-            return;
-        }
         let sourceCube = advancedSourceCube();
         const shiftPressed = modifierPressed(data, 'shift');
         const altPressed = modifierPressed(data, 'alt');
+
+        // Once a source corner is stored, Alt is an operation on that stored corner.
+        // It must not depend on the second click producing another vertex hit.
+        if (sourceCube && state.advancedVertex.stage === 'target_vertex' &&
+            altPressed && state.advancedVertex.sourceVertex) {
+            resetNativeVertexSnapWorkflow(false);
+            if (moveSourceVertexToMirrorPlane(sourceCube, state.advancedVertex.sourceVertex)) {
+                resetAdvancedVertexOperation(true);
+                resetNativeVertexSnapWorkflow(true);
+            }
+            return;
+        }
+
+        const hit = resolveCubeFeatureHit(data);
+        if (!hit) {
+            quick(state.advancedVertex.stage === 'target_vertex'
+                ? 'Keine Zielecke erkannt · einen sichtbaren Zielpunkt oder nahe an die Ecke klicken'
+                : 'Keine Ecke oder Kante erkannt · näher an einen Griffpunkt klicken');
+            return;
+        }
 
         if (!sourceCube) {
             if (hit.cube) {
@@ -1527,15 +1740,16 @@
                 if (altPressed) {
                     if (moveSourceVertexToMirrorPlane(sourceCube, descriptor)) {
                         resetAdvancedVertexOperation(true);
-                        refreshNativeVertexSnapGizmos();
+                        resetNativeVertexSnapWorkflow(true);
                     }
                     return;
                 }
                 state.advancedVertex.sourceVertex = descriptor;
                 state.advancedVertex.stage = 'target_vertex';
+                const targetsVisible = beginNativeTargetVertexMode(data, sourceCube);
                 quick(state.smartMirrorEnabled
-                    ? 'Quellecke gewählt · jetzt Zielecke anklicken · Alt+Klick auf die Quellecke richtet sie direkt an der Spiegelachse aus'
-                    : 'Quellecke gewählt · jetzt eine Zielecke anklicken', 5200);
+                    ? `Quellecke gewählt · ${targetsVisible ? 'Zielpunkte eingeblendet' : 'jetzt Zielecke anklicken'} · Alt+Klick richtet die gespeicherte Ecke an der Spiegelachse aus`
+                    : `Quellecke gewählt · ${targetsVisible ? 'Zielpunkte eingeblendet' : 'jetzt eine Zielecke anklicken'}`, 5200);
                 return;
             }
             if (hit.type !== 'edge') {
@@ -1552,6 +1766,7 @@
             state.pendingVertexSnapAuthority = null;
             state.advancedVertex.sourceEdge = cloneEdgeDescriptor(hit.edge);
             state.advancedVertex.stage = 'target_choice';
+            showNativeTargetVertexGizmos(sourceCube);
             quick('Quellkante gewählt - jetzt Zielkante ODER erste Zielecke anklicken', 3600);
             return;
         }
@@ -1569,18 +1784,12 @@
             state.advancedVertex.sourceEdge = descriptor;
             state.advancedVertex.sourceEdgeVertexA = null;
             state.advancedVertex.stage = 'target_choice';
+            showNativeTargetVertexGizmos(sourceCube);
             quick('Quellkante über zwei Ecken gewählt · jetzt Zielkante oder erste Zielecke anklicken', 4200);
             return;
         }
 
         if (state.advancedVertex.stage === 'target_vertex') {
-            if (altPressed && state.advancedVertex.sourceVertex) {
-                if (moveSourceVertexToMirrorPlane(sourceCube, state.advancedVertex.sourceVertex)) {
-                    resetAdvancedVertexOperation(true);
-                    refreshNativeVertexSnapGizmos();
-                }
-                return;
-            }
             if (hit.type !== 'vertex') {
                 quick('Als Ziel bitte eine Ecke anklicken');
                 return;
@@ -1589,9 +1798,10 @@
                 quick('Die Zielecke muss zu einem anderen Cube gehören');
                 return;
             }
+            resetNativeVertexSnapWorkflow(false);
             if (moveSourceVertexToTarget(sourceCube, state.advancedVertex.sourceVertex, hit.vertex)) {
                 resetAdvancedVertexOperation(true);
-                refreshNativeVertexSnapGizmos();
+                resetNativeVertexSnapWorkflow(true);
                 quick('Quellecke auf Zielecke verschoben · Größe und Rotation unverändert');
             }
             return;
@@ -1633,7 +1843,7 @@
             };
             if (fitSourceEdgeBetweenVertices(sourceCube, state.advancedVertex.sourceEdge, state.advancedVertex.targetVertexA, targetB)) {
                 resetAdvancedVertexOperation(true);
-                refreshNativeVertexSnapGizmos();
+                resetNativeVertexSnapWorkflow(true);
                 quick('Kante exakt zwischen den beiden Ecken eingepasst');
             }
         }
@@ -2713,10 +2923,10 @@
             editOpen = false;
             state.mirrorGuard = oldMirrorGuard;
 
-            // Selecting every generated layer draws all outlines through the solid
-            // model and makes different bevel curves look almost identical. Keep only
-            // the original middle profile selected so the final silhouette is readable.
-            selectOnlyCubes(analysis.cubes);
+            // Any selected middle-layer cubes still draw internal outlines through the
+            // solid and can visually hide the difference between bevel curves. Clear
+            // the selection after creation so the generated silhouette is unobstructed.
+            selectOnlyCubes([]);
             try {
                 Canvas.updateView({
                     elements: allAffected,
@@ -2727,7 +2937,7 @@
                 try { Canvas.updateAll(); } catch (_) {}
             }
             if (state.smartMirrorEnabled) rebuildMirrorPairs();
-            quick(`${created.length} Klingen-Cubes erzeugt · ${totalLayerCount} Schichten · Mittelschicht ausgewählt`, 5600);
+            quick(`${created.length} Klingen-Cubes erzeugt · ${totalLayerCount} Schichten · Kontur frei sichtbar`, 5600);
             return true;
         } catch (e) {
             warn('Detailed blade generation failed', e);
@@ -3003,7 +3213,8 @@
                 },
                 onCanvasMouseMove(data) {
                     try {
-                        if (nativeVertexSnapAvailable() && typeof Vertexsnap.hoverCanvas === 'function') {
+                        if (state.advancedVertex.nativeVertexSourcePrimed &&
+                            nativeVertexSnapAvailable() && typeof Vertexsnap.hoverCanvas === 'function') {
                             Vertexsnap.hoverCanvas(data && data.event ? data.event : data);
                         }
                     } catch (_) {}
